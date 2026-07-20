@@ -1,0 +1,44 @@
+Table users {
+  id int [pk, increment]
+  region varchar [not null]
+  email varchar [unique]
+}
+
+Table orders {
+  id int [pk]
+  user_id int [not null]
+  region varchar
+  total decimal(10,2)
+}
+
+Table order_items {
+  order_id int [pk]
+  product_id int [pk]
+  qty int [default: 1]
+}
+
+Table products {
+  id int [pk]
+  name varchar [note: 'display name']
+}
+
+Table audit_log {
+  id bigint [pk]
+  actor int [ref: > users.id]
+  at timestamp
+}
+
+Ref: orders.(user_id, region) > users.(id, region)
+Ref: order_items.order_id > orders.id
+Ref: order_items.product_id > products.id
+
+TableGroup commerce [color: #1E69FD] {
+  orders
+  order_items
+  products
+}
+
+TableGroup identity {
+  users
+  audit_log
+}

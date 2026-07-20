@@ -55,6 +55,10 @@ pub struct App {
     dump_dialog: Option<DumpState>,
     import_dialog: Option<ImportState>,
     export_dialog: Option<ExportState>,
+    dbml_file_dialog: egui_file_dialog::FileDialog,
+    /// Dirty diagram tab whose close button was clicked once; a second click
+    /// discards the unsaved changes.
+    close_armed: Option<TabId>,
 }
 
 impl App {
@@ -80,6 +84,8 @@ impl App {
             dump_dialog: None,
             import_dialog: None,
             export_dialog: None,
+            dbml_file_dialog: egui_file_dialog::FileDialog::new(),
+            close_armed: None,
         };
         // Probe Claude auth status at startup so the panel populates lazily.
         app.send(Pending::AuthStatus, |req| Command::AuthStatus { req });
@@ -577,6 +583,53 @@ impl App {
         self.active_tab = Some(id);
     }
 
+    fn open_diagram_tab(&mut self, path: std::path::PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        // Focus an existing tab if one already shows this file.
+        if let Some(existing_id) = self
+            .tabs
+            .iter()
+            .find(|t| matches!(t, Tab::Diagram(d) if d.path == path))
+            .map(|t| t.id())
+        {
+            self.active_tab = Some(existing_id);
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = Some(format!("Could not read {}: {e}", path.display()));
+                return;
+            }
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let id = Uuid::new_v4();
+        self.tabs.push(Tab::Diagram(crate::ui::diagram_tab::DiagramTab::open(
+            id, path, text, mtime,
+        )));
+        self.active_tab = Some(id);
+    }
+
+    fn save_diagram_file(&mut self, tab_id: TabId) {
+        let Some(Tab::Diagram(d)) = self.find_tab_mut(tab_id) else { return };
+        let disk_mtime = std::fs::metadata(&d.path).and_then(|m| m.modified()).ok();
+        let changed_externally =
+            matches!((disk_mtime, d.file_mtime), (Some(a), Some(b)) if a != b);
+        if let Err(e) = std::fs::write(&d.path, &d.text) {
+            let msg = format!("Could not save {}: {e}", d.path.display());
+            self.status = Some(msg);
+            return;
+        }
+        d.saved_text = d.text.clone();
+        d.file_mtime = std::fs::metadata(&d.path).and_then(|m| m.modified()).ok();
+        let name = d.path.display().to_string();
+        self.status = Some(if changed_externally {
+            format!("Saved {name} (overwrote external changes)")
+        } else {
+            format!("Saved {name}")
+        });
+    }
+
     fn open_table_tab(&mut self, profile_id: Uuid, schema: String, table: String) {
         self.open_table_tab_view(profile_id, schema, table, EditorView::Data);
     }
@@ -771,7 +824,7 @@ impl App {
         };
         self.runtime.send(Command::Disconnect { conn: conn_id });
         self.active.retain(|a| a.profile_id != profile_id);
-        self.tabs.retain(|t| t.profile_id() != profile_id);
+        self.tabs.retain(|t| t.profile_id() != Some(profile_id));
         if let Some(id) = self.active_tab {
             if !self.tabs.iter().any(|t| t.id() == id) {
                 self.active_tab = None;
@@ -807,6 +860,14 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.ai_panel.open = !self.ai_panel.open;
+                    }
+
+                    if ui
+                        .button("◈ Open .dbml…")
+                        .on_hover_text("Open a DBML file as an editable diagram")
+                        .clicked()
+                    {
+                        self.dbml_file_dialog.select_file();
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -863,6 +924,12 @@ impl eframe::App for App {
         if let Some(d) = self.export_dialog.as_mut() {
             let action = crate::ui::import_export::draw_export(ctx, d);
             pending_actions.push(Box::new(move |app: &mut Self| app.handle_export_action(action)));
+        }
+
+        // DBML file picker.
+        self.dbml_file_dialog.update(ctx);
+        if let Some(picked) = self.dbml_file_dialog.take_selected() {
+            self.open_diagram_tab(picked);
         }
 
         egui::SidePanel::left("sidebar")
@@ -1037,9 +1104,23 @@ impl eframe::App for App {
                                 }
                             }
                             if let Some(id) = to_close {
-                                self.tabs.retain(|t| t.id() != id);
-                                if self.active_tab == Some(id) {
-                                    self.active_tab = self.tabs.first().map(|t| t.id());
+                                // Dirty diagram tabs need a second click to
+                                // discard unsaved DBML changes.
+                                let dirty_diagram = self.tabs.iter().any(|t| {
+                                    matches!(t, Tab::Diagram(d) if d.id == id && d.is_dirty())
+                                });
+                                if dirty_diagram && self.close_armed != Some(id) {
+                                    self.close_armed = Some(id);
+                                    self.status = Some(
+                                        "Unsaved .dbml changes — close again to discard, or Ctrl+S to save"
+                                            .into(),
+                                    );
+                                } else {
+                                    self.close_armed = None;
+                                    self.tabs.retain(|t| t.id() != id);
+                                    if self.active_tab == Some(id) {
+                                        self.active_tab = self.tabs.first().map(|t| t.id());
+                                    }
                                 }
                             }
                         });
@@ -1118,6 +1199,23 @@ impl eframe::App for App {
                                 }
                             }
                             handle_structure_action(action, t, &mut pending_actions);
+                        }
+                    }
+                }
+                Tab::Diagram(d) => {
+                    use crate::ui::diagram_tab::DiagramAction;
+                    match crate::ui::diagram_tab::draw(ui, d) {
+                        DiagramAction::None => {}
+                        DiagramAction::SaveFile => {
+                            let tab_id = d.id;
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.save_diagram_file(tab_id);
+                            }));
+                        }
+                        DiagramAction::Status(s) => {
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.status = Some(s);
+                            }));
                         }
                     }
                 }

@@ -34,6 +34,20 @@ impl ThemeMode {
 /// Primary accent used for selection and focus. Legible on both themes.
 pub const ACCENT: Color32 = Color32::from_rgb(88, 152, 237);
 
+/// Categorical palette for diagram table-groups without an explicit DBML
+/// color. Mid-saturation hues; used at low alpha for fills so a single
+/// palette stays legible on both themes.
+pub const GROUP_COLORS: [Color32; 8] = [
+    Color32::from_rgb(88, 152, 237),
+    Color32::from_rgb(64, 170, 160),
+    Color32::from_rgb(149, 117, 205),
+    Color32::from_rgb(222, 146, 80),
+    Color32::from_rgb(106, 176, 105),
+    Color32::from_rgb(214, 112, 150),
+    Color32::from_rgb(181, 166, 80),
+    Color32::from_rgb(205, 97, 85),
+];
+
 /// Install the font fallback chain. Hack (the bundled monospace font) covers
 /// geometric/arrow glyphs (→ ● ▦ ◈ ⊘ ⇄ ◌) that the default proportional
 /// chain (Ubuntu-Light → NotoEmoji → emoji-icon-font) lacks — without this,

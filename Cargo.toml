@@ -41,6 +41,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 sqlparser = "0.61"
 nucleo-matcher = "0.3"
 egui-file-dialog = "0.6"
+dbml-rs = { version = "1.0.1", default-features = false }
+pest = { version = "2.8", default-features = false }
 
 [profile.release]
 lto = "thin"

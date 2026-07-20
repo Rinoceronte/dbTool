@@ -6,6 +6,7 @@ pub mod connections;
 pub mod csv_export;
 pub mod csv_import;
 pub mod db;
+pub mod dbml;
 pub mod mcp_server;
 pub mod runtime;
 pub mod sql_complete;

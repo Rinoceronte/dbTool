@@ -1,6 +1,8 @@
 pub mod ai_panel;
 pub mod auth_dialog;
 pub mod completion_popup;
+pub mod diagram_canvas;
+pub mod diagram_tab;
 pub mod import_export;
 pub mod query_tab;
 pub mod results_grid;
@@ -40,6 +42,7 @@ pub struct SchemaNode {
 pub enum Tab {
     Query(QueryTab),
     TableEditor(TableEditorTab),
+    Diagram(diagram_tab::DiagramTab),
 }
 
 impl Tab {
@@ -47,6 +50,7 @@ impl Tab {
         match self {
             Tab::Query(t) => t.id,
             Tab::TableEditor(t) => t.id,
+            Tab::Diagram(t) => t.id,
         }
     }
     pub fn title(&self) -> String {
@@ -56,12 +60,16 @@ impl Tab {
                 format!("{}.{} (new)", t.schema, t.table)
             }
             Tab::TableEditor(t) => format!("{}.{}", t.schema, t.table),
+            Tab::Diagram(t) => t.title(),
         }
     }
-    pub fn profile_id(&self) -> ProfileId {
+    /// The connection a tab belongs to; `None` for connection-agnostic tabs
+    /// (diagrams), which must survive disconnects.
+    pub fn profile_id(&self) -> Option<ProfileId> {
         match self {
-            Tab::Query(t) => t.profile_id,
-            Tab::TableEditor(t) => t.profile_id,
+            Tab::Query(t) => Some(t.profile_id),
+            Tab::TableEditor(t) => Some(t.profile_id),
+            Tab::Diagram(_) => None,
         }
     }
 }
