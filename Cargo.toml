@@ -1,0 +1,47 @@
+[package]
+name = "dbtool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# UI
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+winit = { version = "0.29", default-features = false, features = ["x11"] }
+egui = "0.28"
+egui_extras = { version = "0.28", features = [] }
+
+# async / DB
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json", "chrono", "uuid"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# persistence / secrets
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+urlencoding = "2"
+
+# utilities
+csv = "1"
+anyhow = "1"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Agent runtime (claude CLI + in-process MCP HTTP server)
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# SQL completion
+sqlparser = "0.61"
+nucleo-matcher = "0.3"
+egui-file-dialog = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

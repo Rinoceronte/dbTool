@@ -1,0 +1,12 @@
+pub mod ai_session;
+pub mod ai_tools;
+pub mod app;
+pub mod claude_auth;
+pub mod connections;
+pub mod csv_export;
+pub mod csv_import;
+pub mod db;
+pub mod mcp_server;
+pub mod runtime;
+pub mod sql_complete;
+pub mod ui;
