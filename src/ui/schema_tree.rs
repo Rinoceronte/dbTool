@@ -10,6 +10,8 @@ pub enum TreeAction {
     Disconnect(ProfileId),
     /// Dump DDL files for one schema, or the whole connection when None.
     DumpDdl(ProfileId, Option<String>),
+    /// Introspect the whole database and open it as a DBML diagram.
+    ViewAsDbml(ProfileId),
     /// Import a data file into schema.table.
     ImportInto(ProfileId, String, String),
     /// Export schema.table's data to a delimited file.
@@ -48,6 +50,10 @@ pub fn draw(ui: &mut egui::Ui, active: &mut [ActiveConnection]) -> TreeAction {
             name_resp.context_menu(|ui| {
                 if ui.button("New query tab").clicked() {
                     action = TreeAction::OpenQueryTab(conn.profile_id);
+                    ui.close_menu();
+                }
+                if ui.button("View as DBML diagram").clicked() {
+                    action = TreeAction::ViewAsDbml(conn.profile_id);
                     ui.close_menu();
                 }
                 if ui.button("Dump DDL to folder…").clicked() {

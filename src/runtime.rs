@@ -56,6 +56,8 @@ pub enum Command {
         schemas: Vec<String>,
         dir: String,
     },
+    /// Introspect every table of every schema for DBML generation.
+    DumpDbml { req: RequestId, conn: ConnectionId },
     ImportCsv {
         req: RequestId,
         conn: ConnectionId,
@@ -138,6 +140,11 @@ pub enum Event {
         req: RequestId,
         dir: String,
         files: usize,
+        errors: Vec<String>,
+    },
+    DbmlDumped {
+        req: RequestId,
+        tables: Vec<crate::db::structure::TableStructure>,
         errors: Vec<String>,
     },
     ImportProgress { req: RequestId, rows: u64 },
@@ -418,6 +425,18 @@ async fn handle_command(
             }
         }
 
+        Command::DumpDbml { req, conn } => {
+            let Some(driver) = get_driver(&connections, conn).await else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            match dump_dbml(driver).await {
+                Ok((tables, errors)) => {
+                    send(&evt_tx, &ctx, Event::DbmlDumped { req, tables, errors })
+                }
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
         Command::ImportCsv { req, conn, schema, table, path, options } => {
             let Some(driver) = get_driver(&connections, conn).await else {
                 return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
@@ -512,6 +531,32 @@ fn expand_home(path: &str) -> std::path::PathBuf {
 
 /// Dump DDL of every table/view in `schemas` (all schemas when empty) to
 /// `<dir>/<schema>/<object>.sql`. Returns (files written, per-object errors).
+/// Introspect every base table (views excluded — DBML has no view concept)
+/// across all schemas. Per-table failures are collected, not fatal.
+pub async fn dump_dbml(
+    driver: DynDriver,
+) -> anyhow::Result<(Vec<crate::db::structure::TableStructure>, Vec<String>)> {
+    let schemas = driver.list_schemas().await?;
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    for schema in schemas {
+        let tables = match driver.list_tables(&schema).await {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(format!("{schema}: list tables failed: {e:#}"));
+                continue;
+            }
+        };
+        for t in tables.iter().filter(|t| matches!(t.kind, crate::db::TableKind::Table)) {
+            match driver.describe_structure(&schema, &t.name).await {
+                Ok(s) => out.push(s),
+                Err(e) => errors.push(format!("{schema}.{}: {e:#}", t.name)),
+            }
+        }
+    }
+    Ok((out, errors))
+}
+
 pub async fn dump_ddl(
     driver: DynDriver,
     schemas: Vec<String>,

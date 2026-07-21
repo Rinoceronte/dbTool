@@ -32,6 +32,7 @@ enum Pending {
     ApplyDdl(TabId),
     FetchDbMeta(Uuid),
     DumpDdl,
+    DumpDbml(Uuid), // profile id
     ImportCsv,
     ExportCsv,
     AuthStatus,
@@ -449,6 +450,54 @@ impl App {
                     }
                     self.status = Some(format!("DDL dump: {files} file(s) written."));
                 }
+            }
+            Event::DbmlDumped { req, tables, errors } => {
+                let Some(op) = self.pending.remove(&req) else { return };
+                let Pending::DumpDbml(profile_id) = op else { return };
+                let name = self
+                    .find_active(profile_id)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| "database".to_owned());
+                if tables.is_empty() {
+                    self.status = Some(format!(
+                        "View as DBML: no tables found in {name}{}",
+                        if errors.is_empty() { String::new() } else { format!(" ({} error(s))", errors.len()) }
+                    ));
+                    return;
+                }
+                let text = crate::dbml::generate(&tables, &name);
+                let dir = dirs::config_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("dbTool")
+                    .join("dbml");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    self.status = Some(format!("Could not create {}: {e}", dir.display()));
+                    return;
+                }
+                let safe: String = name
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .collect();
+                let path = dir.join(format!("{safe}.dbml"));
+                if let Err(e) = std::fs::write(&path, &text) {
+                    self.status = Some(format!("Could not write {}: {e}", path.display()));
+                    return;
+                }
+                // Regeneration refreshes an already-open tab; the layout
+                // sidecar keys by schema.table, so positions survive.
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                self.tabs
+                    .retain(|t| !matches!(t, Tab::Diagram(d) if d.path == canonical));
+                self.open_diagram_tab(path);
+                self.status = Some(if errors.is_empty() {
+                    format!("Generated DBML for {} table(s) from {name}", tables.len())
+                } else {
+                    format!(
+                        "Generated DBML for {} table(s) from {name} — {} object(s) skipped",
+                        tables.len(),
+                        errors.len()
+                    )
+                });
             }
             Event::ImportProgress { req, rows } => {
                 if let Some(Pending::ImportCsv) = self.pending.get(&req) {
@@ -1451,6 +1500,15 @@ impl App {
             }
             T::Disconnect(profile_id) => {
                 self.disconnect_profile(profile_id);
+            }
+            T::ViewAsDbml(profile_id) => {
+                let Some(ac) = self.find_active(profile_id) else { return };
+                let conn = ac.conn_id;
+                self.status = Some(format!("Introspecting {} for DBML…", ac.name));
+                self.send(Pending::DumpDbml(profile_id), move |req| Command::DumpDbml {
+                    req,
+                    conn,
+                });
             }
             T::DumpDdl(profile_id, schema) => {
                 let Some(ac) = self.find_active(profile_id) else { return };
