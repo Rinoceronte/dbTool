@@ -18,6 +18,7 @@ pub fn dialect_keywords(d: DbKind) -> &'static [&'static str] {
         DbKind::Postgres => &["ILIKE", "RETURNING", "OFFSET", "FETCH", "LATERAL", "USING"],
         DbKind::MySql => &["LIMIT", "OFFSET", "USING", "STRAIGHT_JOIN"],
         DbKind::MsSql => &["TOP", "OFFSET", "FETCH", "CROSS APPLY", "OUTER APPLY", "PIVOT", "UNPIVOT", "OUTPUT", "MERGE"],
+        DbKind::Sqlite => &["LIMIT", "OFFSET", "PRAGMA", "ATTACH", "DETACH", "RETURNING", "GLOB", "VACUUM"],
     }
 }
 

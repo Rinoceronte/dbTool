@@ -12,7 +12,7 @@ egui_extras = { version = "0.28", features = [] }
 
 # async / DB
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "json", "chrono", "uuid"] }
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -27,6 +27,7 @@ urlencoding = "2"
 
 # utilities
 csv = "1"
+notify-rust = { version = "4", default-features = false, features = ["d"] }
 anyhow = "1"
 thiserror = "1"
 log = "0.4"
@@ -43,6 +44,7 @@ nucleo-matcher = "0.3"
 egui-file-dialog = "0.6"
 dbml-rs = { version = "1.0.1", default-features = false }
 pest = { version = "2.8", default-features = false }
+sqlformat = "0.5.0"
 
 [profile.release]
 lto = "thin"

@@ -7,12 +7,12 @@ use std::collections::HashMap;
 
 use super::{
     ColumnSchema, ConnectParams, DbKind, DbMeta, Driver, ForeignKey, PkValues, ResultSet,
-    RowChanges, TableInfo, TableKind, TableMeta, TableSchema, Value,
+    RowChanges, RowsFilter, SchemaObjects, TableInfo, TableKind, TableMeta, TableSchema, Value,
     structure::{
         CheckInfo, ColumnInfo, DdlOutcome, FkInfo, IdentityKind, IndexInfo, KeyInfo,
         TableStructure,
     },
-    types::Column as MetaColumn,
+    types::{Column as MetaColumn, EnumInfo, RoutineInfo, TriggerInfo},
 };
 
 pub struct PostgresDriver {
@@ -27,6 +27,113 @@ impl PostgresDriver {
             .await
             .context("postgres connect")?;
         Ok(Self { pool })
+    }
+
+    /// The editor query path, pinned to one connection (so the session is
+    /// known and can be cancelled, and scripts share a transaction). Returns
+    /// one ResultSet per data-producing statement; a script with none yields
+    /// a single rows-affected summary.
+    async fn run_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        sql: &str,
+    ) -> Result<Vec<ResultSet>> {
+        let cap = super::effective_row_cap();
+        if super::is_multi_statement(sql) {
+            use futures::TryStreamExt as _;
+            let mut stream = sqlx::raw_sql(sql).fetch_many(&mut *conn);
+            let mut affected = 0u64;
+            let mut current: Vec<PgRow> = Vec::new();
+            let mut cur_truncated = false;
+            let mut sets: Vec<ResultSet> = Vec::new();
+            while let Some(item) = stream.try_next().await? {
+                match item {
+                    sqlx::Either::Left(done) => {
+                        affected += done.rows_affected();
+                        if !current.is_empty() {
+                            let mut rs = result_set_from_pg_rows(std::mem::take(&mut current));
+                            rs.truncated = std::mem::take(&mut cur_truncated);
+                            sets.push(rs);
+                        }
+                    }
+                    // The script must run to completion, so rows past the cap
+                    // are drained but not kept.
+                    sqlx::Either::Right(row) => {
+                        if current.len() < cap {
+                            current.push(row);
+                        } else {
+                            cur_truncated = true;
+                        }
+                    }
+                }
+            }
+            if !current.is_empty() {
+                let mut rs = result_set_from_pg_rows(current);
+                rs.truncated = cur_truncated;
+                sets.push(rs);
+            }
+            if sets.is_empty() {
+                sets.push(ResultSet {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: Some(affected),
+                    truncated: false,
+                });
+            }
+            return Ok(sets);
+        }
+        let trimmed = sql.trim_start().to_ascii_uppercase();
+        let is_select = trimmed.starts_with("SELECT")
+            || trimmed.starts_with("WITH")
+            || trimmed.starts_with("SHOW")
+            || trimmed.starts_with("EXPLAIN");
+        if is_select {
+            use futures::TryStreamExt as _;
+            let mut stream = sqlx::query(sql).fetch(&mut *conn);
+            let mut rows: Vec<PgRow> = Vec::new();
+            let mut truncated = false;
+            while let Some(row) = stream.try_next().await? {
+                if rows.len() >= cap {
+                    truncated = true;
+                    break;
+                }
+                rows.push(row);
+            }
+            drop(stream);
+            let mut rs = result_set_from_pg_rows(rows);
+            rs.truncated = truncated;
+            if rs.columns.is_empty() {
+                rs.columns = columns_via_describe(&self.pool, sql).await;
+            }
+            Ok(vec![rs])
+        } else {
+            let res = sqlx::query(sql).execute(&mut *conn).await?;
+            Ok(vec![ResultSet {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: Some(res.rows_affected()),
+                truncated: false,
+            }])
+        }
+    }
+}
+
+/// Surface the server's error position (1-based chars) in the message so the
+/// editor can jump the caret to it.
+fn annotate_pg_position(e: anyhow::Error) -> anyhow::Error {
+    let pos = e.downcast_ref::<sqlx::Error>().and_then(|se| match se {
+        sqlx::Error::Database(db) => db
+            .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+            .and_then(|pg| pg.position())
+            .and_then(|p| match p {
+                sqlx::postgres::PgErrorPosition::Original(n) => Some(n),
+                _ => None,
+            }),
+        _ => None,
+    });
+    match pos {
+        Some(n) => e.context(format!("[position:{n}]")),
+        None => e,
     }
 }
 
@@ -95,7 +202,7 @@ fn result_set_from_pg_rows(rows: Vec<PgRow>) -> ResultSet {
         .iter()
         .map(|r| (0..r.columns().len()).map(|i| pg_value_from_row(r, i)).collect())
         .collect();
-    ResultSet { columns, rows: data, rows_affected: None }
+    ResultSet { columns, rows: data, rows_affected: None, truncated: false }
 }
 
 fn ident(name: &str) -> String {
@@ -167,22 +274,62 @@ impl Driver for PostgresDriver {
         Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT datname FROM pg_database \
+             WHERE NOT datistemplate AND datallowconn ORDER BY datname",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT table_name, table_type FROM information_schema.tables \
-             WHERE table_schema = $1 ORDER BY table_name",
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT t.table_name, t.table_type, \
+                    obj_description(format('%I.%I', t.table_schema, t.table_name)::regclass) \
+             FROM information_schema.tables t \
+             WHERE t.table_schema = $1 ORDER BY t.table_name",
         )
         .bind(schema)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(name, kind)| TableInfo {
+            .map(|(name, kind, comment)| TableInfo {
                 schema: schema.to_string(),
                 name,
                 kind: if kind.contains("VIEW") { TableKind::View } else { TableKind::Table },
+                comment: comment.filter(|c| !c.is_empty()),
             })
             .collect())
+    }
+
+    async fn table_comments(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Option<String>, Vec<(String, Option<String>)>)> {
+        let table_comment: Option<String> = sqlx::query_scalar(
+            "SELECT obj_description(format('%I.%I', $1::text, $2::text)::regclass)",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_one(&self.pool)
+        .await?;
+        let cols: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT c.column_name, \
+                    col_description(format('%I.%I', c.table_schema, c.table_name)::regclass, \
+                                    c.ordinal_position::int) \
+             FROM information_schema.columns c \
+             WHERE c.table_schema = $1 AND c.table_name = $2 \
+             ORDER BY c.ordinal_position",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok((table_comment.filter(|c| !c.is_empty()), cols))
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema> {
@@ -231,11 +378,67 @@ impl Driver for PostgresDriver {
     }
 
     async fn query(&self, sql: &str) -> Result<ResultSet> {
+        let cap = super::effective_row_cap();
+        if super::is_multi_statement(sql) {
+            // Whole script via the simple protocol: runs on ONE pooled
+            // connection, so BEGIN…COMMIT inside the script works, and the
+            // server handles statement splitting (incl. $$ bodies).
+            use futures::TryStreamExt as _;
+            let mut stream = sqlx::raw_sql(sql).fetch_many(&self.pool);
+            let mut affected = 0u64;
+            let mut current: Vec<PgRow> = Vec::new();
+            let mut cur_truncated = false;
+            let mut last: Vec<PgRow> = Vec::new();
+            let mut last_truncated = false;
+            while let Some(item) = stream.try_next().await? {
+                match item {
+                    sqlx::Either::Left(done) => {
+                        affected += done.rows_affected();
+                        if !current.is_empty() {
+                            last = std::mem::take(&mut current);
+                            last_truncated = std::mem::take(&mut cur_truncated);
+                        }
+                    }
+                    sqlx::Either::Right(row) => {
+                        if current.len() < cap {
+                            current.push(row);
+                        } else {
+                            cur_truncated = true;
+                        }
+                    }
+                }
+            }
+            if !current.is_empty() {
+                last = current;
+                last_truncated = cur_truncated;
+            }
+            let mut rs = result_set_from_pg_rows(last);
+            rs.truncated = last_truncated;
+            if rs.columns.is_empty() {
+                rs.rows_affected = Some(affected);
+            }
+            return Ok(rs);
+        }
         let trimmed = sql.trim_start().to_ascii_uppercase();
-        let is_select = trimmed.starts_with("SELECT") || trimmed.starts_with("WITH") || trimmed.starts_with("SHOW");
+        let is_select = trimmed.starts_with("SELECT")
+            || trimmed.starts_with("WITH")
+            || trimmed.starts_with("SHOW")
+            || trimmed.starts_with("EXPLAIN");
         if is_select {
-            let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+            use futures::TryStreamExt as _;
+            let mut stream = sqlx::query(sql).fetch(&self.pool);
+            let mut rows: Vec<PgRow> = Vec::new();
+            let mut truncated = false;
+            while let Some(row) = stream.try_next().await? {
+                if rows.len() >= cap {
+                    truncated = true;
+                    break;
+                }
+                rows.push(row);
+            }
+            drop(stream);
             let mut rs = result_set_from_pg_rows(rows);
+            rs.truncated = truncated;
             if rs.columns.is_empty() {
                 rs.columns = columns_via_describe(&self.pool, sql).await;
             }
@@ -246,7 +449,40 @@ impl Driver for PostgresDriver {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: Some(res.rows_affected()),
+                truncated: false,
             })
+        }
+    }
+
+    async fn query_script(
+        &self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        let mut conn = self.pool.acquire().await?;
+        // Know the session up front so cancel can target it server-side.
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await?;
+        let outcome = {
+            let fut = self.run_on_conn(&mut conn, sql);
+            tokio::select! {
+                r = fut => Some(r),
+                _ = cancel.cancelled() => None,
+            }
+        };
+        match outcome {
+            Some(r) => r.map_err(annotate_pg_position),
+            None => {
+                // Ask the server to abort the statement, then close the
+                // (protocol-dirty) connection instead of pooling it.
+                let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                    .bind(pid)
+                    .execute(&self.pool)
+                    .await;
+                drop(conn.detach());
+                Err(anyhow!("Query cancelled"))
+            }
         }
     }
 
@@ -256,20 +492,124 @@ impl Driver for PostgresDriver {
         table: &str,
         limit: i64,
         offset: i64,
+        filter: &RowsFilter,
     ) -> Result<ResultSet> {
-        let sql = format!(
-            "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
-            ident(schema),
-            ident(table),
-            limit,
-            offset
-        );
+        let mut sql = format!("SELECT * FROM {}.{}", ident(schema), ident(table));
+        if !filter.where_clause.trim().is_empty() {
+            sql.push_str(&format!(" WHERE {}", filter.where_clause.trim()));
+        }
+        if let Some(col) = &filter.order_col {
+            sql.push_str(&format!(
+                " ORDER BY {} {}",
+                ident(col),
+                if filter.order_desc { "DESC" } else { "ASC" }
+            ));
+        }
+        sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         let mut rs = result_set_from_pg_rows(rows);
         if rs.columns.is_empty() {
             rs.columns = columns_via_describe(&self.pool, &sql).await;
         }
         Ok(rs)
+    }
+
+    async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects> {
+        let routines: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT p.proname,
+                    CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
+                    pg_get_function_identity_arguments(p.oid),
+                    COALESCE(pg_get_function_result(p.oid), '')
+             FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = $1 AND p.prokind IN ('f', 'p')
+             ORDER BY p.proname",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let routines = routines
+            .into_iter()
+            .map(|(name, kind, args, ret)| RoutineInfo {
+                name,
+                kind,
+                detail: if ret.is_empty() {
+                    format!("({args})")
+                } else {
+                    format!("({args}) → {ret}")
+                },
+            })
+            .collect();
+
+        let sequences: Vec<(String,)> = sqlx::query_as(
+            "SELECT sequence_name::text FROM information_schema.sequences
+             WHERE sequence_schema = $1 ORDER BY 1",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let enum_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT t.typname, e.enumlabel
+             FROM pg_type t
+             JOIN pg_enum e ON e.enumtypid = t.oid
+             JOIN pg_namespace n ON n.oid = t.typnamespace
+             WHERE n.nspname = $1
+             ORDER BY t.typname, e.enumsortorder",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut enums: Vec<EnumInfo> = Vec::new();
+        for (name, label) in enum_rows {
+            match enums.last_mut() {
+                Some(last) if last.name == name => last.values.push(label),
+                _ => enums.push(EnumInfo { name, values: vec![label] }),
+            }
+        }
+
+        let triggers: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT trigger_name::text, event_object_table::text,
+                    action_timing::text, string_agg(event_manipulation::text, ' OR ')
+             FROM information_schema.triggers
+             WHERE trigger_schema = $1
+             GROUP BY trigger_name, event_object_table, action_timing
+             ORDER BY 1",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let triggers = triggers
+            .into_iter()
+            .map(|(name, table, timing, events)| TriggerInfo {
+                name,
+                table,
+                detail: format!("{timing} {events}"),
+            })
+            .collect();
+
+        Ok(SchemaObjects {
+            routines,
+            sequences: sequences.into_iter().map(|(s,)| s).collect(),
+            enums,
+            triggers,
+        })
+    }
+
+    async fn routine_ddl(&self, schema: &str, name: &str, _kind: &str) -> Result<String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT pg_get_functiondef(p.oid)
+             FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = $1 AND p.proname = $2
+             LIMIT 1",
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(d,)| d)
+            .ok_or_else(|| anyhow!("no definition found for {schema}.{name}"))
     }
 
     async fn update_row(

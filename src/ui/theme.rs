@@ -5,7 +5,7 @@ use egui::{Color32, Rounding, Stroke};
 
 use crate::db::DbKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThemeMode {
     Dark,
     Light,
@@ -33,6 +33,9 @@ impl ThemeMode {
 
 /// Primary accent used for selection and focus. Legible on both themes.
 pub const ACCENT: Color32 = Color32::from_rgb(88, 152, 237);
+
+/// Production-connection tint: cards, badges and tab strips.
+pub const PROD_RED: Color32 = Color32::from_rgb(205, 82, 82);
 
 /// Categorical palette for diagram table-groups without an explicit DBML
 /// color. Mid-saturation hues; used at low alpha for fills so a single
@@ -170,6 +173,7 @@ pub fn driver_color(kind: DbKind) -> Color32 {
         DbKind::Postgres => Color32::from_rgb(70, 125, 195),
         DbKind::MySql => Color32::from_rgb(22, 150, 158),
         DbKind::MsSql => Color32::from_rgb(198, 92, 72),
+        DbKind::Sqlite => Color32::from_rgb(114, 132, 154),
     }
 }
 
@@ -178,6 +182,7 @@ pub fn driver_abbr(kind: DbKind) -> &'static str {
         DbKind::Postgres => "PG",
         DbKind::MySql => "MY",
         DbKind::MsSql => "MS",
+        DbKind::Sqlite => "SQ",
     }
 }
 

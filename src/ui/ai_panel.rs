@@ -237,7 +237,9 @@ pub fn draw(
                     .selected_text(current_label)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut state.selected_profile, None, "<none>");
-                        for ac in active {
+                        // Selection is profile-keyed; extra per-database
+                        // connections would be duplicate entries here.
+                        for ac in active.iter().filter(|a| a.is_primary) {
                             ui.selectable_value(
                                 &mut state.selected_profile,
                                 Some(ac.profile_id),
@@ -280,8 +282,11 @@ pub fn draw(
                 .max_height(history_height.max(80.0))
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for item in &state.display {
-                        if let Some(sql) = render_item(ui, item) {
+                    // Salt each item's scope: repeated widgets ("result"
+                    // collapsers, buttons) would otherwise clash ids.
+                    for (idx, item) in state.display.iter().enumerate() {
+                        let sql = ui.push_id(("ai_item", idx), |ui| render_item(ui, item)).inner;
+                        if let Some(sql) = sql {
                             open_in_editor = Some(sql);
                         }
                         ui.add_space(6.0);

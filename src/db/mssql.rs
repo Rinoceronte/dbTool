@@ -9,12 +9,12 @@ use std::collections::HashMap;
 
 use super::{
     ColumnSchema, ConnectParams, DbKind, DbMeta, Driver, ForeignKey, PkValues, ResultSet,
-    RowChanges, TableInfo, TableKind, TableMeta, TableSchema, Value,
+    RowChanges, RowsFilter, SchemaObjects, TableInfo, TableKind, TableMeta, TableSchema, Value,
     structure::{
         CheckInfo, ColumnInfo, DdlOutcome, FkInfo, IdentityKind, IndexInfo, KeyInfo,
         TableStructure,
     },
-    types::Column as MetaColumn,
+    types::{Column as MetaColumn, RoutineInfo, TriggerInfo},
 };
 
 type MsClient = Client<Compat<TcpStream>>;
@@ -194,7 +194,7 @@ fn result_set_from_rows(rows: Vec<tiberius::Row>) -> ResultSet {
         .iter()
         .map(|r| (0..r.columns().len()).map(|i| ms_value_from_row(r, i)).collect())
         .collect();
-    ResultSet { columns, rows: data, rows_affected: None }
+    ResultSet { columns, rows: data, rows_affected: None, truncated: false }
 }
 
 fn update_sql(schema: &str, table: &str, changes: &RowChanges, pk: &PkValues) -> String {
@@ -319,12 +319,26 @@ impl Driver for MsSqlDriver {
         Ok(rows.iter().map(|r| opt_str(r, 0)).collect())
     }
 
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        let mut client = self.client.lock().await;
+        let rows = client
+            .simple_query("SELECT name FROM sys.databases WHERE state = 0 ORDER BY name")
+            .await?
+            .into_first_result()
+            .await?;
+        Ok(rows.iter().map(|r| opt_str(r, 0)).collect())
+    }
+
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>> {
         let mut client = self.client.lock().await;
         let rows = client
             .query(
-                "SELECT table_name, table_type FROM information_schema.tables \
-                 WHERE table_schema = @P1 ORDER BY table_name",
+                "SELECT t.table_name, t.table_type, CAST(ep.value AS NVARCHAR(1000)) \
+                 FROM information_schema.tables t \
+                 LEFT JOIN sys.extended_properties ep \
+                   ON ep.major_id = OBJECT_ID(QUOTENAME(t.table_schema) + '.' + QUOTENAME(t.table_name)) \
+                  AND ep.minor_id = 0 AND ep.name = 'MS_Description' \
+                 WHERE t.table_schema = @P1 ORDER BY t.table_name",
                 &[&schema],
             )
             .await?
@@ -334,13 +348,71 @@ impl Driver for MsSqlDriver {
             .iter()
             .map(|r| {
                 let kind = opt_str(r, 1);
+                let comment = r
+                    .try_get::<&str, _>(2)
+                    .ok()
+                    .flatten()
+                    .map(|s: &str| s.to_owned())
+                    .filter(|s| !s.is_empty());
                 TableInfo {
                     schema: schema.to_string(),
                     name: opt_str(r, 0),
                     kind: if kind.contains("VIEW") { TableKind::View } else { TableKind::Table },
+                    comment,
                 }
             })
             .collect())
+    }
+
+    async fn table_comments(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Option<String>, Vec<(String, Option<String>)>)> {
+        let object = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+        let mut client = self.client.lock().await;
+        let trows = client
+            .query(
+                "SELECT CAST(value AS NVARCHAR(2000)) FROM sys.extended_properties \
+                 WHERE major_id = OBJECT_ID(@P1) AND minor_id = 0 AND name = 'MS_Description'",
+                &[&object.as_str()],
+            )
+            .await?
+            .into_first_result()
+            .await?;
+        let table_comment = trows
+            .first()
+            .and_then(|r| r.try_get::<&str, _>(0).ok().flatten())
+            .map(|s: &str| s.to_owned())
+            .filter(|s| !s.is_empty());
+        let crows = client
+            .query(
+                "SELECT c.name, CAST(ep.value AS NVARCHAR(2000)) \
+                 FROM sys.columns c \
+                 LEFT JOIN sys.extended_properties ep \
+                   ON ep.major_id = c.object_id AND ep.minor_id = c.column_id \
+                  AND ep.name = 'MS_Description' \
+                 WHERE c.object_id = OBJECT_ID(@P1) \
+                 ORDER BY c.column_id",
+                &[&object.as_str()],
+            )
+            .await?
+            .into_first_result()
+            .await?;
+        let cols = crows
+            .iter()
+            .map(|r| {
+                let name = opt_str(r, 0);
+                let comment = r
+                    .try_get::<&str, _>(1)
+                    .ok()
+                    .flatten()
+                    .map(|s: &str| s.to_owned())
+                    .filter(|s| !s.is_empty());
+                (name, comment)
+            })
+            .collect();
+        Ok((table_comment, cols))
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema> {
@@ -395,12 +467,20 @@ impl Driver for MsSqlDriver {
         let trimmed = sql.trim_start().to_ascii_uppercase();
         let is_select = trimmed.starts_with("SELECT") || trimmed.starts_with("WITH");
         let mut client = self.client.lock().await;
-        if is_select {
+        // Scripts and SELECTs both go through simple_query — the whole batch
+        // runs on this single session, so multi-statement scripts and
+        // BEGIN TRAN…COMMIT work; the last result set with rows is shown.
+        if is_select || super::is_multi_statement(sql) {
             let mut stream = client.simple_query(sql).await?;
             let meta = stream_columns(&mut stream).await?;
             let results = stream.into_results().await?;
-            let rows = results.into_iter().find(|r| !r.is_empty()).unwrap_or_default();
+            let rows = results
+                .into_iter()
+                .rev()
+                .find(|r| !r.is_empty())
+                .unwrap_or_default();
             let mut rs = result_set_from_rows(rows);
+            rs.apply_cap(super::effective_row_cap());
             if rs.columns.is_empty() {
                 rs.columns = meta;
             }
@@ -411,7 +491,57 @@ impl Driver for MsSqlDriver {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: Some(res.total()),
+                truncated: false,
             })
+        }
+    }
+
+    async fn query_script(
+        &self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        // Cooperative cancel only: tiberius has no clean server-side kill for
+        // an in-flight batch on the same client.
+        let run = async {
+            let trimmed = sql.trim_start().to_ascii_uppercase();
+            let is_select = trimmed.starts_with("SELECT") || trimmed.starts_with("WITH");
+            let mut client = self.client.lock().await;
+            if is_select || super::is_multi_statement(sql) {
+                let mut stream = client.simple_query(sql).await?;
+                let meta = stream_columns(&mut stream).await?;
+                let results = stream.into_results().await?;
+                let cap = super::effective_row_cap();
+                let mut sets: Vec<ResultSet> = results
+                    .into_iter()
+                    .filter(|r| !r.is_empty())
+                    .map(|r| {
+                        let mut rs = result_set_from_rows(r);
+                        rs.apply_cap(cap);
+                        rs
+                    })
+                    .collect();
+                if sets.is_empty() {
+                    let mut rs = result_set_from_rows(vec![]);
+                    rs.columns = meta;
+                    sets.push(rs);
+                }
+                Ok(sets)
+            } else {
+                let res = client.execute(sql, &[]).await?;
+                Ok(vec![ResultSet {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: Some(res.total()),
+                    truncated: false,
+                }])
+            }
+        };
+        tokio::select! {
+            r = run => r,
+            _ = cancel.cancelled() => Err(anyhow::anyhow!(
+                "Query cancelled (the server may still finish the statement)"
+            )),
         }
     }
 
@@ -421,9 +551,23 @@ impl Driver for MsSqlDriver {
         table: &str,
         limit: i64,
         offset: i64,
+        filter: &RowsFilter,
     ) -> Result<ResultSet> {
+        let where_sql = if filter.where_clause.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filter.where_clause.trim())
+        };
+        let order_sql = match &filter.order_col {
+            Some(col) => format!(
+                "ORDER BY {} {}",
+                ident(col),
+                if filter.order_desc { "DESC" } else { "ASC" }
+            ),
+            None => "ORDER BY (SELECT NULL)".to_owned(),
+        };
         let sql = format!(
-            "SELECT * FROM {}.{} ORDER BY (SELECT NULL) \
+            "SELECT * FROM {}.{}{where_sql} {order_sql} \
              OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
             ident(schema),
             ident(table),
@@ -439,6 +583,70 @@ impl Driver for MsSqlDriver {
             rs.columns = meta;
         }
         Ok(rs)
+    }
+
+    async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects> {
+        let esc = schema.replace('\'', "''");
+        let mut client = self.client.lock().await;
+
+        let sql = format!(
+            "SELECT o.name, o.type FROM sys.objects o \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE s.name = '{esc}' AND o.type IN ('P', 'FN', 'IF', 'TF') \
+             ORDER BY o.name"
+        );
+        let rows = client.simple_query(sql).await?.into_first_result().await?;
+        let routines = rows
+            .iter()
+            .map(|r| {
+                let ty = opt_str(r, 1);
+                RoutineInfo {
+                    name: opt_str(r, 0),
+                    kind: if ty.trim() == "P" { "procedure".into() } else { "function".into() },
+                    detail: String::new(),
+                }
+            })
+            .collect();
+
+        let sql = format!(
+            "SELECT sq.name FROM sys.sequences sq \
+             JOIN sys.schemas s ON s.schema_id = sq.schema_id \
+             WHERE s.name = '{esc}' ORDER BY sq.name"
+        );
+        let rows = client.simple_query(sql).await?.into_first_result().await?;
+        let sequences = rows.iter().map(|r| opt_str(r, 0)).collect();
+
+        let sql = format!(
+            "SELECT tr.name, t.name, \
+                    CASE WHEN tr.is_instead_of_trigger = 1 THEN 'INSTEAD OF' ELSE 'AFTER' END \
+             FROM sys.triggers tr \
+             JOIN sys.tables t ON t.object_id = tr.parent_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             WHERE s.name = '{esc}' ORDER BY tr.name"
+        );
+        let rows = client.simple_query(sql).await?.into_first_result().await?;
+        let triggers = rows
+            .iter()
+            .map(|r| TriggerInfo {
+                name: opt_str(r, 0),
+                table: opt_str(r, 1),
+                detail: opt_str(r, 2),
+            })
+            .collect();
+
+        Ok(SchemaObjects { routines, sequences, enums: Vec::new(), triggers })
+    }
+
+    async fn routine_ddl(&self, schema: &str, name: &str, _kind: &str) -> Result<String> {
+        let esc = format!("{}.{}", schema, name).replace('\'', "''");
+        let sql = format!("SELECT OBJECT_DEFINITION(OBJECT_ID('{esc}'))");
+        let mut client = self.client.lock().await;
+        let rows = client.simple_query(sql).await?.into_first_result().await?;
+        let def = rows.first().map(|r| opt_str(r, 0)).unwrap_or_default();
+        if def.trim().is_empty() {
+            anyhow::bail!("no definition found for {schema}.{name}");
+        }
+        Ok(def)
     }
 
     async fn update_row(

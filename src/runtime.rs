@@ -1,8 +1,8 @@
 use crate::ai_session::{self, ApprovalDecision, SessionEvent, SessionId, SessionInputs};
 use crate::claude_auth::{self, AuthStatus};
 use crate::db::{
-    self, ConnectParams, DbMeta, DynDriver, PkValues, ResultSet, RowChanges, TableInfo, TableSchema,
-    structure::TableStructure,
+    self, ConnectParams, DbMeta, DynDriver, PkValues, ResultSet, RowChanges, RowsFilter,
+    SchemaObjects, TableInfo, TableSchema, structure::TableStructure,
 };
 use crate::mcp_server::McpServer;
 use std::collections::HashMap;
@@ -18,9 +18,24 @@ pub type RequestId = Uuid;
 pub enum Command {
     Connect { req: RequestId, params: ConnectParams },
     ListSchemas { req: RequestId, conn: ConnectionId },
+    /// List server databases/catalogs (for the per-connection database toggles).
+    ListDatabases { req: RequestId, conn: ConnectionId },
     ListTables { req: RequestId, conn: ConnectionId, schema: String },
+    /// Functions, sequences, enums, triggers of one schema.
+    ListSchemaObjects { req: RequestId, conn: ConnectionId, schema: String },
+    /// Fetch a routine's source for viewing.
+    RoutineDdl { req: RequestId, conn: ConnectionId, schema: String, name: String, kind: String },
+    TableComments { req: RequestId, conn: ConnectionId, schema: String, table: String },
     DescribeTable { req: RequestId, conn: ConnectionId, schema: String, table: String },
-    Query { req: RequestId, conn: ConnectionId, sql: String },
+    Query {
+        req: RequestId,
+        conn: ConnectionId,
+        sql: String,
+        /// Lift the result row cap for this run ("Fetch all rows").
+        unlimited: bool,
+    },
+    /// Abort a running Query task by its request id.
+    CancelQuery { req: RequestId },
     FetchTableRows {
         req: RequestId,
         conn: ConnectionId,
@@ -28,6 +43,7 @@ pub enum Command {
         table: String,
         limit: i64,
         offset: i64,
+        filter: RowsFilter,
     },
     InsertRow {
         req: RequestId,
@@ -82,6 +98,29 @@ pub enum Command {
         path: String,
         options: crate::csv_export::ExportOptions,
     },
+    /// Row-level data compare of the selected tables across two connections.
+    DataCompare {
+        req: RequestId,
+        source: ConnectionId,
+        target: ConnectionId,
+        tables: Vec<crate::db::datasync::TableSel>,
+        diff_cap: usize,
+    },
+    /// Sanitized full replace: DELETE + re-INSERT each table on the target,
+    /// masking in flight. Tables must already be in FK-safe order.
+    DataPull {
+        req: RequestId,
+        source: ConnectionId,
+        target: ConnectionId,
+        tables: Vec<crate::db::datasync::TableSel>,
+        masks: crate::db::datasync::MaskMap,
+        row_limit: Option<u64>,
+    },
+    /// Whole-database dump via the engine's native tool (pg_dump/mysqldump;
+    /// SQLite = file copy). Tunnelled profiles get a fresh tunnel.
+    DumpDatabase { req: RequestId, conn: ConnectionId, path: String },
+    /// Restore a dump written by DumpDatabase into this connection's database.
+    RestoreDatabase { req: RequestId, conn: ConnectionId, path: String },
     Disconnect { conn: ConnectionId },
     AiStart {
         session: SessionId,
@@ -110,7 +149,15 @@ pub enum Event {
     Connected { req: RequestId, conn: ConnectionId },
     ConnectFailed { req: RequestId, error: String },
     Schemas { req: RequestId, conn: ConnectionId, schemas: Vec<String> },
+    Databases { req: RequestId, conn: ConnectionId, databases: Vec<String> },
     Tables { req: RequestId, conn: ConnectionId, schema: String, tables: Vec<TableInfo> },
+    SchemaObjects { req: RequestId, conn: ConnectionId, schema: String, objects: SchemaObjects },
+    RoutineDdl { req: RequestId, conn: ConnectionId, name: String, ddl: String },
+    TableComments {
+        req: RequestId,
+        table_comment: Option<String>,
+        columns: Vec<(String, Option<String>)>,
+    },
     TableDescribed {
         req: RequestId,
         conn: ConnectionId,
@@ -118,7 +165,11 @@ pub enum Event {
         table: String,
         table_schema: TableSchema,
     },
-    QueryResult { req: RequestId, result: ResultSet },
+    QueryResult { req: RequestId, results: Vec<ResultSet> },
+    /// Keepalive rebuilt a dead connection under the same id.
+    Reconnected { conn: ConnectionId },
+    /// Keepalive found the connection dead and could not rebuild it (yet).
+    ConnectionLost { conn: ConnectionId, error: String },
     TableRows {
         req: RequestId,
         conn: ConnectionId,
@@ -145,6 +196,20 @@ pub enum Event {
     DbmlDumped {
         req: RequestId,
         tables: Vec<crate::db::structure::TableStructure>,
+        errors: Vec<String>,
+    },
+    /// Free-form progress line for long data compare/pull runs.
+    DataProgress { req: RequestId, message: String },
+    /// A dump or restore finished; message is the human summary.
+    BackupDone { req: RequestId, message: String },
+    DataCompared {
+        req: RequestId,
+        reports: Vec<crate::db::datasync::TableReport>,
+    },
+    DataPulled {
+        req: RequestId,
+        tables: usize,
+        rows: u64,
         errors: Vec<String>,
     },
     ImportProgress { req: RequestId, rows: u64 },
@@ -198,7 +263,16 @@ impl Runtime {
     }
 }
 
-type Connections = Arc<RwLock<HashMap<ConnectionId, DynDriver>>>;
+/// One live connection: the driver plus, when tunnelled, the ssh child whose
+/// drop (kill_on_drop) tears the tunnel down with the connection. Params are
+/// kept so the keepalive loop can rebuild a dead connection in place.
+struct ConnEntry {
+    driver: DynDriver,
+    _tunnel: Option<tokio::process::Child>,
+    params: db::ConnectParams,
+}
+
+type Connections = Arc<RwLock<HashMap<ConnectionId, ConnEntry>>>;
 
 struct SessionHandle {
     cancel: CancellationToken,
@@ -207,6 +281,11 @@ struct SessionHandle {
 
 type Sessions = Arc<RwLock<HashMap<SessionId, SessionHandle>>>;
 
+/// Cancellation tokens of in-flight editor queries, keyed by request id.
+/// Cancelling one lets the driver abort SERVER-side (pg_cancel_backend /
+/// KILL QUERY) before the task returns.
+type QueryCancels = Arc<RwLock<HashMap<RequestId, CancellationToken>>>;
+
 async fn worker_main(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     evt_tx: mpsc::UnboundedSender<Event>,
@@ -214,6 +293,7 @@ async fn worker_main(
 ) {
     let connections: Connections = Arc::new(RwLock::new(HashMap::new()));
     let sessions: Sessions = Arc::new(RwLock::new(HashMap::new()));
+    let cancels: QueryCancels = Arc::new(RwLock::new(HashMap::new()));
     let mcp = match McpServer::spawn().await {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -224,6 +304,42 @@ async fn worker_main(
     };
 
     while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Command::CancelQuery { req } => {
+                if let Some(t) = cancels.write().await.remove(&req) {
+                    t.cancel();
+                    // The query task reports "Query cancelled" itself.
+                }
+                continue;
+            }
+            Command::Query { req, conn, sql, unlimited } => {
+                let token = CancellationToken::new();
+                cancels.write().await.insert(req, token.clone());
+                let evt_tx = evt_tx.clone();
+                let ctx = ctx.clone();
+                let connections = connections.clone();
+                let cancels = cancels.clone();
+                let cap_override = unlimited.then_some(usize::MAX);
+                tokio::spawn(crate::db::RESULT_CAP_OVERRIDE.scope(cap_override, async move {
+                    let Some(driver) = get_driver(&connections, conn).await else {
+                        cancels.write().await.remove(&req);
+                        return send(
+                            &evt_tx,
+                            &ctx,
+                            Event::Error { req, error: "connection not found".into() },
+                        );
+                    };
+                    let result = driver.query_script(&sql, token).await;
+                    cancels.write().await.remove(&req);
+                    match result {
+                        Ok(results) => send(&evt_tx, &ctx, Event::QueryResult { req, results }),
+                        Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+                    }
+                }));
+                continue;
+            }
+            _ => {}
+        }
         let evt_tx = evt_tx.clone();
         let ctx = ctx.clone();
         let connections = connections.clone();
@@ -240,8 +356,53 @@ fn send(evt_tx: &mpsc::UnboundedSender<Event>, ctx: &egui::Context, event: Event
     ctx.request_repaint();
 }
 
+/// Ping every minute; on failure, rebuild the connection (and tunnel) IN
+/// PLACE under the same ConnectionId so open tabs keep working. Exits when
+/// the connection is removed (user disconnect).
+fn spawn_keepalive(
+    conn: ConnectionId,
+    connections: Connections,
+    evt_tx: mpsc::UnboundedSender<Event>,
+    ctx: egui::Context,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let Some(driver) = get_driver(&connections, conn).await else { break };
+            if driver.ping().await.is_ok() {
+                continue;
+            }
+            let params = match connections.read().await.get(&conn) {
+                Some(e) => e.params.clone(),
+                None => break,
+            };
+            match db::connect(&params).await {
+                Ok((driver, tunnel)) => {
+                    let mut map = connections.write().await;
+                    match map.get_mut(&conn) {
+                        Some(e) => {
+                            e.driver = driver;
+                            e._tunnel = tunnel;
+                            send(&evt_tx, &ctx, Event::Reconnected { conn });
+                        }
+                        None => break,
+                    }
+                }
+                Err(e) => {
+                    send(
+                        &evt_tx,
+                        &ctx,
+                        Event::ConnectionLost { conn, error: format!("{e:#}") },
+                    );
+                    // Keep trying on the next tick.
+                }
+            }
+        }
+    });
+}
+
 async fn get_driver(connections: &Connections, conn: ConnectionId) -> Option<DynDriver> {
-    connections.read().await.get(&conn).cloned()
+    connections.read().await.get(&conn).map(|e| e.driver.clone())
 }
 
 async fn handle_command(
@@ -254,9 +415,13 @@ async fn handle_command(
 ) {
     match cmd {
         Command::Connect { req, params } => match db::connect(&params).await {
-            Ok(driver) => {
+            Ok((driver, tunnel)) => {
                 let id = ConnectionId::new_v4();
-                connections.write().await.insert(id, driver);
+                connections
+                    .write()
+                    .await
+                    .insert(id, ConnEntry { driver, _tunnel: tunnel, params });
+                spawn_keepalive(id, connections.clone(), evt_tx.clone(), ctx.clone());
                 send(&evt_tx, &ctx, Event::Connected { req, conn: id });
             }
             Err(e) => send(&evt_tx, &ctx, Event::ConnectFailed { req, error: format!("{e:#}") }),
@@ -266,12 +431,109 @@ async fn handle_command(
             connections.write().await.remove(&conn);
         }
 
+        Command::DumpDatabase { req, conn, path } => {
+            let params = match connections.read().await.get(&conn) {
+                Some(e) => e.params.clone(),
+                None => {
+                    return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+                }
+            };
+            match backup_database(&params, &path, false).await {
+                Ok(message) => send(&evt_tx, &ctx, Event::BackupDone { req, message }),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::RestoreDatabase { req, conn, path } => {
+            let params = match connections.read().await.get(&conn) {
+                Some(e) => e.params.clone(),
+                None => {
+                    return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+                }
+            };
+            match backup_database(&params, &path, true).await {
+                Ok(message) => send(&evt_tx, &ctx, Event::BackupDone { req, message }),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::DataCompare { req, source, target, tables, diff_cap } => {
+            let (Some(src), Some(tgt)) = (
+                get_driver(&connections, source).await,
+                get_driver(&connections, target).await,
+            ) else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            let mut reports = Vec::with_capacity(tables.len());
+            for (i, sel) in tables.iter().enumerate() {
+                send(
+                    &evt_tx,
+                    &ctx,
+                    Event::DataProgress {
+                        req,
+                        message: format!("comparing {} ({}/{})", sel.key(), i + 1, tables.len()),
+                    },
+                );
+                reports.push(crate::db::datasync::compare_table(&src, &tgt, sel, diff_cap).await);
+            }
+            send(&evt_tx, &ctx, Event::DataCompared { req, reports });
+        }
+
+        Command::DataPull { req, source, target, tables, masks, row_limit } => {
+            let (Some(src), Some(tgt)) = (
+                get_driver(&connections, source).await,
+                get_driver(&connections, target).await,
+            ) else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            let mut rows = 0u64;
+            let mut done = 0usize;
+            let mut errors = Vec::new();
+            // Deletes must run children-first (reverse FK order), inserts
+            // parents-first. Clearing everything up front keeps both happy.
+            for sel in tables.iter().rev() {
+                let tbl = format!(
+                    "{}.{}",
+                    crate::db::quote_ident(tgt.kind(), &sel.schema),
+                    crate::db::quote_ident(tgt.kind(), &sel.table)
+                );
+                if let Err(e) = tgt.query(&format!("DELETE FROM {tbl}")).await {
+                    errors.push(format!("{}: clear failed: {e:#}", sel.key()));
+                }
+            }
+            for sel in &tables {
+                let progress = |message: String| {
+                    send(&evt_tx, &ctx, Event::DataProgress { req, message });
+                };
+                match crate::db::datasync::pull_table(&src, &tgt, sel, &masks, row_limit, &progress)
+                    .await
+                {
+                    Ok(n) => {
+                        rows += n;
+                        done += 1;
+                    }
+                    Err(e) => errors.push(format!("{}: {e:#}", sel.key())),
+                }
+            }
+            send(&evt_tx, &ctx, Event::DataPulled { req, tables: done, rows, errors });
+        }
+
         Command::ListSchemas { req, conn } => {
             let Some(driver) = get_driver(&connections, conn).await else {
                 return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
             };
             match driver.list_schemas().await {
                 Ok(schemas) => send(&evt_tx, &ctx, Event::Schemas { req, conn, schemas }),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::ListDatabases { req, conn } => {
+            let Some(driver) = get_driver(&connections, conn).await else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            match driver.list_databases().await {
+                Ok(databases) => send(&evt_tx, &ctx, Event::Databases { req, conn, databases }),
                 Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
             }
         }
@@ -300,21 +562,71 @@ async fn handle_command(
             }
         }
 
-        Command::Query { req, conn, sql } => {
+        Command::Query { req, conn, sql, .. } => {
             let Some(driver) = get_driver(&connections, conn).await else {
                 return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
             };
             match driver.query(&sql).await {
-                Ok(result) => send(&evt_tx, &ctx, Event::QueryResult { req, result }),
+                Ok(result) => {
+                    send(&evt_tx, &ctx, Event::QueryResult { req, results: vec![result] })
+                }
                 Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
             }
         }
 
-        Command::FetchTableRows { req, conn, schema, table, limit, offset } => {
+        Command::CancelQuery { .. } => {
+            // Handled inline in worker_main; unreachable here.
+        }
+
+        Command::ListSchemaObjects { req, conn, schema } => {
             let Some(driver) = get_driver(&connections, conn).await else {
                 return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
             };
-            match driver.fetch_table_rows(&schema, &table, limit, offset).await {
+            match driver.list_schema_objects(&schema).await {
+                Ok(objects) => send(
+                    &evt_tx,
+                    &ctx,
+                    Event::SchemaObjects { req, conn, schema, objects },
+                ),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::RoutineDdl { req, conn, schema, name, kind } => {
+            let Some(driver) = get_driver(&connections, conn).await else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            // "view" rides the same pipe: its CREATE comes from table_ddl.
+            let result = if kind == "view" {
+                driver.table_ddl(&schema, &name, crate::db::TableKind::View).await
+            } else {
+                driver.routine_ddl(&schema, &name, &kind).await
+            };
+            match result {
+                Ok(ddl) => send(&evt_tx, &ctx, Event::RoutineDdl { req, conn, name, ddl }),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::TableComments { req, conn, schema, table } => {
+            let Some(driver) = get_driver(&connections, conn).await else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            match driver.table_comments(&schema, &table).await {
+                Ok((table_comment, columns)) => send(
+                    &evt_tx,
+                    &ctx,
+                    Event::TableComments { req, table_comment, columns },
+                ),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::FetchTableRows { req, conn, schema, table, limit, offset, filter } => {
+            let Some(driver) = get_driver(&connections, conn).await else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            match driver.fetch_table_rows(&schema, &table, limit, offset, &filter).await {
                 Ok(result) => send(
                     &evt_tx,
                     &ctx,
@@ -509,6 +821,133 @@ async fn handle_command(
     }
 }
 
+/// Dump or restore a whole database with the engine's native tool.
+/// Tunnelled profiles get their own tunnel for the run. Postgres uses the
+/// custom format (`pg_dump -Fc` / `pg_restore --clean --if-exists`);
+/// MySQL plain SQL (`mysqldump` / `mysql < file`); SQLite copies the file.
+async fn backup_database(
+    params: &db::ConnectParams,
+    path: &str,
+    restore: bool,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+
+    let file = expand_home(path);
+    if restore && !file.exists() {
+        anyhow::bail!("{} does not exist", file.display());
+    }
+    if !restore {
+        if let Some(parent) = file.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+        }
+    }
+
+    if params.kind == db::DbKind::Sqlite {
+        // The database IS a file; a copy is a full dump.
+        let db_file = std::path::PathBuf::from(&params.database);
+        if restore {
+            std::fs::copy(&file, &db_file)
+                .with_context(|| format!("copy {} → {}", file.display(), db_file.display()))?;
+            return Ok(format!("Restored {} from {}.", db_file.display(), file.display()));
+        }
+        std::fs::copy(&db_file, &file)
+            .with_context(|| format!("copy {} → {}", db_file.display(), file.display()))?;
+        return Ok(format!("Dumped {} to {}.", db_file.display(), file.display()));
+    }
+
+    // Reach tunnelled servers through a fresh forward for the run.
+    let (mut host, mut port) = (params.host.clone(), params.port);
+    let _tunnel = match &params.ssh {
+        Some(ssh) => {
+            let (child, local_port) = db::open_ssh_tunnel(ssh, &params.host, params.port).await?;
+            host = "127.0.0.1".into();
+            port = local_port;
+            Some(child)
+        }
+        None => None,
+    };
+
+    let mut cmd = match (params.kind, restore) {
+        (db::DbKind::Postgres, false) => {
+            let mut c = tokio::process::Command::new("pg_dump");
+            c.arg("-h").arg(&host)
+                .arg("-p").arg(port.to_string())
+                .arg("-U").arg(&params.username)
+                .arg("-d").arg(&params.database)
+                .arg("-Fc")
+                .arg("-f").arg(&file)
+                .env("PGPASSWORD", &params.password);
+            c
+        }
+        (db::DbKind::Postgres, true) => {
+            let mut c = tokio::process::Command::new("pg_restore");
+            c.arg("-h").arg(&host)
+                .arg("-p").arg(port.to_string())
+                .arg("-U").arg(&params.username)
+                .arg("-d").arg(&params.database)
+                .arg("--clean")
+                .arg("--if-exists")
+                .arg("--no-owner")
+                .arg(&file)
+                .env("PGPASSWORD", &params.password);
+            c
+        }
+        (db::DbKind::MySql, false) => {
+            let mut c = tokio::process::Command::new("mysqldump");
+            c.arg("-h").arg(&host)
+                .arg("-P").arg(port.to_string())
+                .arg("-u").arg(&params.username)
+                .arg("--single-transaction")
+                .arg("--routines")
+                .arg("--result-file").arg(&file)
+                .arg(&params.database)
+                .env("MYSQL_PWD", &params.password);
+            c
+        }
+        (db::DbKind::MySql, true) => {
+            let mut c = tokio::process::Command::new("mysql");
+            c.arg("-h").arg(&host)
+                .arg("-P").arg(port.to_string())
+                .arg("-u").arg(&params.username)
+                .arg(&params.database)
+                .env("MYSQL_PWD", &params.password)
+                .stdin(std::fs::File::open(&file).with_context(|| format!("open {}", file.display()))?);
+            c
+        }
+        (db::DbKind::MsSql, _) => {
+            anyhow::bail!(
+                "SQL Server has no portable CLI dump — use BACKUP DATABASE on the server \
+                 or SSMS/sqlpackage."
+            );
+        }
+        (db::DbKind::Sqlite, _) => unreachable!(),
+    };
+    let tool = format!("{:?}", cmd.as_std().get_program());
+    let output = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("spawn {tool} (is it installed and on PATH?)"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "{tool} exited with {}: {}",
+            output.status,
+            err.trim().chars().take(2000).collect::<String>()
+        );
+    }
+    Ok(if restore {
+        format!("Restored '{}' from {}.", params.database, file.display())
+    } else {
+        format!("Dumped '{}' to {}.", params.database, file.display())
+    })
+}
+
 /// Replace path-hostile characters so schema/table names are safe file names.
 fn safe_file_component(name: &str) -> String {
     name.chars()
@@ -617,8 +1056,56 @@ fn open_export_writer(
     Ok(csv::WriterBuilder::new().delimiter(delimiter).from_writer(file))
 }
 
-/// Stream every row of `schema.table` into a delimited file, paging through
-/// the table so large tables never sit in memory all at once.
+/// Incremental writer for a JSON array of row objects.
+struct JsonArrayWriter {
+    out: std::io::BufWriter<std::fs::File>,
+    any: bool,
+}
+
+impl JsonArrayWriter {
+    fn create(path: &str) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        use std::io::Write as _;
+        let file_path = expand_home(path);
+        if let Some(parent) = file_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+        }
+        let file = std::fs::File::create(&file_path)
+            .with_context(|| format!("create {}", file_path.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        out.write_all(b"[").context("write JSON opening")?;
+        Ok(Self { out, any: false })
+    }
+
+    fn write_row(
+        &mut self,
+        columns: &[crate::db::Column],
+        row: &[crate::db::Value],
+    ) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        if self.any {
+            self.out.write_all(b",")?;
+        }
+        self.out.write_all(b"\n  ")?;
+        self.out
+            .write_all(crate::csv_export::row_as_json(columns, row).as_bytes())?;
+        self.any = true;
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        self.out.write_all(b"\n]\n")?;
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
+/// Stream every row of `schema.table` into a file (CSV or JSON), paging
+/// through the table so large tables never sit in memory all at once.
 pub async fn export_table_csv(
     driver: DynDriver,
     schema: &str,
@@ -628,29 +1115,43 @@ pub async fn export_table_csv(
     progress: impl Fn(u64),
 ) -> anyhow::Result<u64> {
     use anyhow::Context as _;
+    use crate::csv_export::ExportFormat;
 
-    let mut writer = open_export_writer(path, options.delimiter)?;
+    let mut csv_writer = match options.format {
+        ExportFormat::Csv => Some(open_export_writer(path, options.delimiter)?),
+        ExportFormat::Json => None,
+    };
+    let mut json_writer = match options.format {
+        ExportFormat::Json => Some(JsonArrayWriter::create(path)?),
+        ExportFormat::Csv => None,
+    };
     let mut total: u64 = 0;
     let mut offset: i64 = 0;
     let mut first_page = true;
     loop {
         let rs = driver
-            .fetch_table_rows(schema, table, EXPORT_PAGE_ROWS, offset)
+            .fetch_table_rows(schema, table, EXPORT_PAGE_ROWS, offset, &RowsFilter::default())
             .await
             .with_context(|| format!("fetch rows at offset {offset}"))?;
         if first_page {
             if options.include_header {
-                writer
-                    .write_record(rs.columns.iter().map(|c| c.name.as_str()))
-                    .context("write header")?;
+                if let Some(w) = csv_writer.as_mut() {
+                    w.write_record(rs.columns.iter().map(|c| c.name.as_str()))
+                        .context("write header")?;
+                }
             }
             first_page = false;
         }
         let page_rows = rs.rows.len();
         for row in &rs.rows {
-            writer
-                .write_record(row.iter().map(crate::csv_export::field_text))
-                .with_context(|| format!("write row {}", total + 1))?;
+            if let Some(w) = csv_writer.as_mut() {
+                w.write_record(row.iter().map(crate::csv_export::field_text))
+                    .with_context(|| format!("write row {}", total + 1))?;
+            }
+            if let Some(w) = json_writer.as_mut() {
+                w.write_row(&rs.columns, row)
+                    .with_context(|| format!("write row {}", total + 1))?;
+            }
             total += 1;
         }
         progress(total);
@@ -659,30 +1160,49 @@ pub async fn export_table_csv(
         }
         offset += EXPORT_PAGE_ROWS;
     }
-    writer.flush().context("flush export file")?;
+    if let Some(mut w) = csv_writer {
+        w.flush().context("flush export file")?;
+    }
+    if let Some(w) = json_writer {
+        w.finish().context("finish JSON export")?;
+    }
     Ok(total)
 }
 
-/// Write an already-fetched result set to a delimited file.
+/// Write an already-fetched result set to a file (CSV or JSON).
 pub fn export_result_csv(
     result: &ResultSet,
     path: &str,
     options: &crate::csv_export::ExportOptions,
 ) -> anyhow::Result<u64> {
     use anyhow::Context as _;
+    use crate::csv_export::ExportFormat;
 
-    let mut writer = open_export_writer(path, options.delimiter)?;
-    if options.include_header {
-        writer
-            .write_record(result.columns.iter().map(|c| c.name.as_str()))
-            .context("write header")?;
+    match options.format {
+        ExportFormat::Csv => {
+            let mut writer = open_export_writer(path, options.delimiter)?;
+            if options.include_header {
+                writer
+                    .write_record(result.columns.iter().map(|c| c.name.as_str()))
+                    .context("write header")?;
+            }
+            for (i, row) in result.rows.iter().enumerate() {
+                writer
+                    .write_record(row.iter().map(crate::csv_export::field_text))
+                    .with_context(|| format!("write row {}", i + 1))?;
+            }
+            writer.flush().context("flush export file")?;
+        }
+        ExportFormat::Json => {
+            let mut writer = JsonArrayWriter::create(path)?;
+            for (i, row) in result.rows.iter().enumerate() {
+                writer
+                    .write_row(&result.columns, row)
+                    .with_context(|| format!("write row {}", i + 1))?;
+            }
+            writer.finish().context("finish JSON export")?;
+        }
     }
-    for (i, row) in result.rows.iter().enumerate() {
-        writer
-            .write_record(row.iter().map(crate::csv_export::field_text))
-            .with_context(|| format!("write row {}", i + 1))?;
-    }
-    writer.flush().context("flush export file")?;
     Ok(result.rows.len() as u64)
 }
 

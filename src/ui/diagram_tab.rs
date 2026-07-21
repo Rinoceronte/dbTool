@@ -1,7 +1,7 @@
 //! DBML diagram tab: text editor pane + toolbar; the canvas lives in
 //! `diagram_canvas`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -64,9 +64,10 @@ pub enum DragKind {
 
 pub struct DiagramTab {
     pub id: TabId,
-    /// Set when this diagram is owned by a connection ("View as DBML"):
-    /// enables the Refresh-from-database action.
-    pub profile_id: Option<crate::ui::ProfileId>,
+    /// Set when this diagram is owned by one database of a connection
+    /// ("View as DBML"): (profile, database name). Enables the
+    /// Refresh-from-database action.
+    pub db_source: Option<(crate::ui::ProfileId, String)>,
     pub path: PathBuf,
     pub text: String,
     pub saved_text: String,
@@ -101,7 +102,7 @@ impl DiagramTab {
         let want_fit = stored.is_none();
         Self {
             id,
-            profile_id: None,
+            db_source: None,
             path,
             saved_text: text.clone(),
             last_parsed: text.clone(),
@@ -157,6 +158,35 @@ impl DiagramTab {
     }
 }
 
+/// TableGroup blocks suggested for tables not already in a group; None when
+/// nothing clusters.
+fn suggest_groups_block(tab: &DiagramTab) -> Option<String> {
+    let m = tab.model.as_ref()?;
+    let loose: Vec<usize> =
+        (0..m.tables.len()).filter(|&i| m.tables[i].group.is_none()).collect();
+    let names: Vec<String> = loose
+        .iter()
+        .map(|&i| crate::dbml::bare_table_name(&m.tables[i].key).to_owned())
+        .collect();
+    let index_of: HashMap<usize, usize> =
+        loose.iter().enumerate().map(|(li, &i)| (i, li)).collect();
+    let edges: Vec<(usize, usize)> = m
+        .refs
+        .iter()
+        .filter_map(|r| Some((*index_of.get(&r.from.0)?, *index_of.get(&r.to.0)?)))
+        .collect();
+    let groups = crate::dbml::suggest_groups(&names, &edges);
+    if groups.is_empty() {
+        return None;
+    }
+    let mut taken: HashSet<String> = m.groups.iter().map(|g| g.name.clone()).collect();
+    Some(crate::dbml::render_table_groups(
+        &groups,
+        |li| crate::dbml::table_ref_from_key(&m.tables[loose[li]].key),
+        &mut taken,
+    ))
+}
+
 pub enum DiagramAction {
     None,
     SaveFile,
@@ -165,7 +195,7 @@ pub enum DiagramAction {
     Status(String),
 }
 
-pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) -> DiagramAction {
+pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab, line_numbers: bool) -> DiagramAction {
     let mut action = DiagramAction::None;
 
     // Ctrl+S anywhere in the tab saves the .dbml file.
@@ -199,7 +229,34 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) -> DiagramAction {
             tab.want_fit = true;
             tab.save_layout();
         }
-        if tab.profile_id.is_some() {
+        if ui
+            .button("Suggest groups")
+            .on_hover_text(
+                "Append TableGroup suggestions for tables not yet in a group, \
+                 clustered by name prefixes and foreign keys. Plain text — \
+                 edit or delete the blocks freely; nothing is written until \
+                 you Ctrl+S.",
+            )
+            .clicked()
+        {
+            match suggest_groups_block(tab) {
+                Some(block) => {
+                    if !tab.text.ends_with('\n') {
+                        tab.text.push('\n');
+                    }
+                    tab.text.push('\n');
+                    tab.text.push_str(&block);
+                }
+                None => {
+                    action = DiagramAction::Status(
+                        "No group suggestions — ungrouped tables don't cluster by \
+                         name or foreign keys"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if tab.db_source.is_some() {
             ui.separator();
             if ui
                 .button("⟳ Refresh from database")
@@ -242,16 +299,35 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) -> DiagramAction {
             .resizable(true)
             .default_width(380.0)
             .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
+                let panel_width = ui.available_width();
+                egui::ScrollArea::both()
                     .id_source(("dbml_editor_scroll", tab.id))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut tab.text)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(40),
-                        );
+                        ui.horizontal_top(|ui| {
+                            let gutter_width = if line_numbers {
+                                crate::ui::line_number_gutter(ui, &tab.text)
+                            } else {
+                                0.0
+                            };
+                            // No-wrap layouter: keeps source lines and visual
+                            // rows 1:1 so the gutter stays aligned; long lines
+                            // scroll horizontally instead.
+                            let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                                crate::ui::layout_code_no_wrap(ui, text)
+                            };
+                            let editor_width = (panel_width
+                                - gutter_width
+                                - ui.spacing().item_spacing.x * 2.0)
+                                .max(100.0);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tab.text)
+                                    .code_editor()
+                                    .desired_width(editor_width)
+                                    .desired_rows(40)
+                                    .layouter(&mut layouter),
+                            );
+                        });
                     });
             });
     }

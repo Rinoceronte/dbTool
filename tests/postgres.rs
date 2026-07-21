@@ -25,6 +25,7 @@ fn parse_url(url: &str) -> ConnectParams {
         username: user.to_string(),
         password: password.to_string(),
         require_ssl: false,
+        ssh: None,
     }
 }
 
@@ -35,7 +36,7 @@ async fn driver_end_to_end() {
         return;
     };
     let params = parse_url(&url);
-    let driver = db::connect(&params).await.expect("connect");
+    let (driver, _tunnel) = db::connect(&params).await.expect("connect");
 
     let schemas = driver.list_schemas().await.expect("list_schemas");
     assert!(schemas.iter().any(|s| s == "public"), "public schema present: {schemas:?}");
@@ -50,7 +51,7 @@ async fn driver_end_to_end() {
     assert!(ts.columns.iter().any(|c| c.name == "name"));
 
     // Fetch rows.
-    let rs = driver.fetch_table_rows("public", "people", 100, 0).await.expect("fetch rows");
+    let rs = driver.fetch_table_rows("public", "people", 100, 0, &Default::default()).await.expect("fetch rows");
     assert_eq!(rs.rows.len(), 3);
 
     // SELECT via query().
@@ -101,7 +102,7 @@ async fn driver_end_to_end() {
         .query("CREATE TABLE \"emptyCamel\" (id bigint, \"createdOn\" timestamptz)")
         .await
         .expect("create empty table");
-    let rs = driver.fetch_table_rows("public", "emptyCamel", 10, 0).await.expect("fetch empty");
+    let rs = driver.fetch_table_rows("public", "emptyCamel", 10, 0, &Default::default()).await.expect("fetch empty");
     assert_eq!(rs.rows.len(), 0);
     let names: Vec<_> = rs.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["id", "createdOn"]);
@@ -117,7 +118,7 @@ async fn ddl_dump_and_csv_import() {
         return;
     };
     let params = parse_url(&url);
-    let driver = db::connect(&params).await.expect("connect");
+    let (driver, _tunnel) = db::connect(&params).await.expect("connect");
 
     // DDL generation for a table with PK + FK.
     let ddl = driver

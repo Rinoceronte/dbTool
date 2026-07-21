@@ -28,6 +28,14 @@ impl SchemaCache {
         Self { meta, schemas, by_schema, by_name, by_full }
     }
 
+    /// Outgoing foreign keys of one table (for FK navigation in the grid).
+    pub fn fks_of(&self, schema: &str, table: &str) -> Vec<crate::db::ForeignKey> {
+        self.by_full
+            .get(&(schema.to_ascii_lowercase(), table.to_ascii_lowercase()))
+            .map(|&i| self.meta.tables[i].foreign_keys.clone())
+            .unwrap_or_default()
+    }
+
     pub fn default_schema(&self) -> &str {
         &self.meta.default_schema
     }

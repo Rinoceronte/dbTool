@@ -7,17 +7,56 @@ use std::collections::HashMap;
 
 use super::{
     ColumnSchema, ConnectParams, DbKind, DbMeta, Driver, ForeignKey, PkValues, ResultSet,
-    RowChanges, TableInfo, TableKind, TableMeta, TableSchema, Value,
+    RowChanges, RowsFilter, SchemaObjects, TableInfo, TableKind, TableMeta, TableSchema, Value,
     structure::{
         CheckInfo, ColumnInfo, DdlOutcome, FkInfo, IdentityKind, IndexInfo, KeyInfo,
         TableStructure,
     },
-    types::Column as MetaColumn,
+    types::{Column as MetaColumn, RoutineInfo, TriggerInfo},
 };
 
 pub struct MySqlDriver {
     pool: MySqlPool,
     default_db: String,
+}
+
+/// Statement-by-statement on ONE checked-out connection, so BEGIN…COMMIT
+/// spanning the script stays on the same session. One ResultSet per
+/// data-producing statement; a script with none yields a single summary.
+async fn run_script_on(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+    sql: &str,
+) -> Result<Vec<ResultSet>> {
+    use sqlx::Executor as _;
+    let mut affected = 0u64;
+    let mut sets: Vec<ResultSet> = Vec::new();
+    for stmt in crate::db::split_statements(sql) {
+        let head = stmt.trim_start().to_ascii_uppercase();
+        let returns_rows = head.starts_with("SELECT")
+            || head.starts_with("WITH")
+            || head.starts_with("SHOW")
+            || head.starts_with("DESCRIBE")
+            || head.starts_with("DESC ")
+            || head.starts_with("EXPLAIN");
+        if returns_rows {
+            let rs = fetch_capped(&mut **conn, &stmt).await?;
+            if !rs.columns.is_empty() {
+                sets.push(rs);
+            }
+        } else {
+            let res = conn.execute(sqlx::query(&stmt)).await?;
+            affected += res.rows_affected();
+        }
+    }
+    if sets.is_empty() {
+        sets.push(ResultSet {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: Some(affected),
+            truncated: false,
+        });
+    }
+    Ok(sets)
 }
 
 impl MySqlDriver {
@@ -79,6 +118,29 @@ fn mysql_value_from_row(row: &MySqlRow, idx: usize) -> Value {
     Value::Text(format!("<{}>", name))
 }
 
+/// Stream a SELECT, stopping row materialization at the configured cap.
+async fn fetch_capped<'e, E>(executor: E, sql: &str) -> Result<ResultSet>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
+    use futures::TryStreamExt as _;
+    let cap = crate::db::effective_row_cap();
+    let mut stream = executor.fetch(sqlx::query(sql));
+    let mut rows: Vec<MySqlRow> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = stream.try_next().await? {
+        if rows.len() >= cap {
+            truncated = true;
+            break;
+        }
+        rows.push(row);
+    }
+    drop(stream);
+    let mut rs = result_set_from_my_rows(rows);
+    rs.truncated = truncated;
+    Ok(rs)
+}
+
 fn result_set_from_my_rows(rows: Vec<MySqlRow>) -> ResultSet {
     let columns: Vec<MetaColumn> = if let Some(first) = rows.first() {
         first
@@ -96,7 +158,7 @@ fn result_set_from_my_rows(rows: Vec<MySqlRow>) -> ResultSet {
         .iter()
         .map(|r| (0..r.columns().len()).map(|i| mysql_value_from_row(r, i)).collect())
         .collect();
-    ResultSet { columns, rows: data, rows_affected: None }
+    ResultSet { columns, rows: data, rows_affected: None, truncated: false }
 }
 
 fn ident(name: &str) -> String {
@@ -159,9 +221,15 @@ impl Driver for MySqlDriver {
         Ok(out)
     }
 
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        // MySQL databases are already surfaced as schemas in the tree.
+        Ok(Vec::new())
+    }
+
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT table_name, table_type FROM information_schema.tables \
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT table_name, table_type, NULLIF(table_comment, '') \
+             FROM information_schema.tables \
              WHERE table_schema = ? ORDER BY table_name",
         )
         .bind(schema)
@@ -169,12 +237,39 @@ impl Driver for MySqlDriver {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(name, kind)| TableInfo {
+            .map(|(name, kind, comment)| TableInfo {
                 schema: schema.to_string(),
                 name,
                 kind: if kind.contains("VIEW") { TableKind::View } else { TableKind::Table },
+                comment,
             })
             .collect())
+    }
+
+    async fn table_comments(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Option<String>, Vec<(String, Option<String>)>)> {
+        let table_comment: Option<String> = sqlx::query_scalar(
+            "SELECT NULLIF(table_comment, '') FROM information_schema.tables \
+             WHERE table_schema = ? AND table_name = ?",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_one(&self.pool)
+        .await?;
+        let cols: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT column_name, NULLIF(column_comment, '') \
+             FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = ? \
+             ORDER BY ordinal_position",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok((table_comment, cols))
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema> {
@@ -210,6 +305,21 @@ impl Driver for MySqlDriver {
     }
 
     async fn query(&self, sql: &str) -> Result<ResultSet> {
+        // Routine DDL bodies contain ';' — never split them.
+        if super::is_multi_statement(sql) && !super::is_routine_ddl(sql) {
+            let mut conn = self.pool.acquire().await?;
+            return run_script_on(&mut conn, sql).await.map(crate::db::collapse_sets);
+        }
+        if super::is_routine_ddl(sql) {
+            // CREATE FUNCTION/PROCEDURE is not preparable — text protocol.
+            let res = sqlx::raw_sql(sql).execute(&self.pool).await?;
+            return Ok(ResultSet {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: Some(res.rows_affected()),
+                truncated: false,
+            });
+        }
         let trimmed = sql.trim_start().to_ascii_uppercase();
         let is_select = trimmed.starts_with("SELECT")
             || trimmed.starts_with("WITH")
@@ -218,8 +328,7 @@ impl Driver for MySqlDriver {
             || trimmed.starts_with("DESC ")
             || trimmed.starts_with("EXPLAIN");
         if is_select {
-            let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
-            let mut rs = result_set_from_my_rows(rows);
+            let mut rs = fetch_capped(&self.pool, sql).await?;
             if rs.columns.is_empty() {
                 rs.columns = columns_via_describe(&self.pool, sql).await;
             }
@@ -230,7 +339,77 @@ impl Driver for MySqlDriver {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: Some(res.rows_affected()),
+                truncated: false,
             })
+        }
+    }
+
+    async fn query_script(
+        &self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        use sqlx::Executor as _;
+        let mut conn = self.pool.acquire().await?;
+        let cid: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *conn)
+            .await?;
+        let outcome = {
+            let fut = async {
+                if crate::db::is_multi_statement(sql) && !crate::db::is_routine_ddl(sql) {
+                    run_script_on(&mut conn, sql).await
+                } else if crate::db::is_routine_ddl(sql) {
+                    let res = conn.execute(sqlx::raw_sql(sql)).await?;
+                    Ok(vec![ResultSet {
+                        columns: vec![],
+                        rows: vec![],
+                        rows_affected: Some(res.rows_affected()),
+                        truncated: false,
+                    }])
+                } else {
+                    let head = sql.trim_start().to_ascii_uppercase();
+                    let returns_rows = head.starts_with("SELECT")
+                        || head.starts_with("WITH")
+                        || head.starts_with("SHOW")
+                        || head.starts_with("DESCRIBE")
+                        || head.starts_with("DESC ")
+                        || head.starts_with("EXPLAIN");
+                    if returns_rows {
+                        Ok(vec![fetch_capped(&mut *conn, sql).await?])
+                    } else {
+                        let res = conn.execute(sqlx::query(sql)).await?;
+                        Ok(vec![ResultSet {
+                            columns: vec![],
+                            rows: vec![],
+                            rows_affected: Some(res.rows_affected()),
+                            truncated: false,
+                        }])
+                    }
+                }
+            };
+            tokio::select! {
+                r = fut => Some(r),
+                _ = cancel.cancelled() => None,
+            }
+        };
+        match outcome {
+            Some(mut r) => {
+                if let Ok(sets) = &mut r {
+                    if let [rs] = sets.as_mut_slice() {
+                        if rs.columns.is_empty() && rs.rows_affected.is_none() {
+                            rs.columns = columns_via_describe(&self.pool, sql).await;
+                        }
+                    }
+                }
+                r
+            }
+            None => {
+                let _ = sqlx::query(&format!("KILL QUERY {cid}"))
+                    .execute(&self.pool)
+                    .await;
+                drop(conn.detach());
+                Err(anyhow!("Query cancelled"))
+            }
         }
     }
 
@@ -240,20 +419,86 @@ impl Driver for MySqlDriver {
         table: &str,
         limit: i64,
         offset: i64,
+        filter: &RowsFilter,
     ) -> Result<ResultSet> {
-        let sql = format!(
-            "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
-            ident(schema),
-            ident(table),
-            limit,
-            offset
-        );
+        let mut sql = format!("SELECT * FROM {}.{}", ident(schema), ident(table));
+        if !filter.where_clause.trim().is_empty() {
+            sql.push_str(&format!(" WHERE {}", filter.where_clause.trim()));
+        }
+        if let Some(col) = &filter.order_col {
+            sql.push_str(&format!(
+                " ORDER BY {} {}",
+                ident(col),
+                if filter.order_desc { "DESC" } else { "ASC" }
+            ));
+        }
+        sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         let mut rs = result_set_from_my_rows(rows);
         if rs.columns.is_empty() {
             rs.columns = columns_via_describe(&self.pool, &sql).await;
         }
         Ok(rs)
+    }
+
+    async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects> {
+        let routines: Vec<(String, String)> = sqlx::query_as(
+            "SELECT routine_name, LOWER(routine_type)
+             FROM information_schema.routines
+             WHERE routine_schema = ? ORDER BY routine_name",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let routines = routines
+            .into_iter()
+            .map(|(name, kind)| RoutineInfo { name, kind, detail: String::new() })
+            .collect();
+
+        let triggers: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT trigger_name, event_object_table, action_timing, event_manipulation
+             FROM information_schema.triggers
+             WHERE trigger_schema = ? ORDER BY trigger_name",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let triggers = triggers
+            .into_iter()
+            .map(|(name, table, timing, event)| TriggerInfo {
+                name,
+                table,
+                detail: format!("{timing} {event}"),
+            })
+            .collect();
+
+        // MySQL has no sequences; enums live inline in column types.
+        Ok(SchemaObjects {
+            routines,
+            sequences: Vec::new(),
+            enums: Vec::new(),
+            triggers,
+        })
+    }
+
+    async fn routine_ddl(&self, schema: &str, name: &str, kind: &str) -> Result<String> {
+        let stmt = if kind.eq_ignore_ascii_case("procedure") {
+            format!("SHOW CREATE PROCEDURE {}.{}", ident(schema), ident(name))
+        } else {
+            format!("SHOW CREATE FUNCTION {}.{}", ident(schema), ident(name))
+        };
+        let rs = self.query(&stmt).await?;
+        // Result has a "Create Function"/"Create Procedure" column.
+        let col = rs
+            .columns
+            .iter()
+            .position(|c| c.name.to_ascii_lowercase().starts_with("create"))
+            .ok_or_else(|| anyhow!("unexpected SHOW CREATE output"))?;
+        rs.rows
+            .first()
+            .and_then(|r| r.get(col))
+            .map(|v| v.display())
+            .ok_or_else(|| anyhow!("no definition found for {schema}.{name}"))
     }
 
     async fn update_row(

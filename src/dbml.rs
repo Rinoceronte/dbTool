@@ -1,6 +1,6 @@
 //! Parse DBML source into an owned diagram model, independent of dbml-rs AST lifetimes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use dbml_rs::ast::{
     Attribute, Nullable, RefIdent, Relation, TableBlock, TopLevelBlock, Value,
@@ -392,11 +392,35 @@ fn seed_user_area(tables: &[TableStructure]) -> String {
             let _ = writeln!(out, "}}\n");
         }
     } else {
-        let _ = writeln!(out, "// Example:");
-        let _ = writeln!(out, "// TableGroup billing [color: #1E69FD] {{");
-        let _ = writeln!(out, "//   invoice");
-        let _ = writeln!(out, "//   payment");
-        let _ = writeln!(out, "// }}");
+        let by_name: HashMap<&str, usize> =
+            tables.iter().enumerate().map(|(i, t)| (t.name.as_str(), i)).collect();
+        let names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (i, t) in tables.iter().enumerate() {
+            for fk in &t.foreign_keys {
+                if let Some(&j) = by_name.get(fk.ref_table.as_str())
+                    && j != i
+                {
+                    edges.push((i, j));
+                }
+            }
+        }
+        let groups = suggest_groups(&names, &edges);
+        if groups.is_empty() {
+            let _ = writeln!(out, "// Example:");
+            let _ = writeln!(out, "// TableGroup billing [color: #1E69FD] {{");
+            let _ = writeln!(out, "//   invoice");
+            let _ = writeln!(out, "//   payment");
+            let _ = writeln!(out, "// }}");
+        } else {
+            out.push('\n');
+            let mut taken = HashSet::new();
+            out.push_str(&render_table_groups(
+                &groups,
+                |i| quote_ident(&tables[i].name),
+                &mut taken,
+            ));
+        }
     }
     out
 }
@@ -442,6 +466,176 @@ pub fn merge_generated(
         }
         _ => format!("{region}\n{existing}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// TableGroup suggestion: name-prefix families + FK skeleton attachment.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SuggestedGroup {
+    /// Bare name of the seed table, doubling as the group name.
+    pub name: String,
+    /// Indices into the input `names` slice, seed first.
+    pub tables: Vec<usize>,
+}
+
+/// Lowercased word tokens of a table name (splits snake_case, kebab-case
+/// and camelCase).
+fn name_tokens(name: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    for ch in name.chars() {
+        if matches!(ch, '_' | '-' | ' ' | '.') {
+            if !cur.is_empty() {
+                toks.push(std::mem::take(&mut cur).to_lowercase());
+            }
+        } else if ch.is_uppercase() && cur.chars().last().is_some_and(char::is_lowercase) {
+            toks.push(std::mem::take(&mut cur).to_lowercase());
+            cur.push(ch);
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        toks.push(cur.to_lowercase());
+    }
+    toks
+}
+
+/// Cluster tables into suggested groups. Two signals:
+///
+/// 1. Name prefixes seed families: `order_item` (and `orderItemTax`, via the
+///    longest matching prefix) belong to `order`.
+/// 2. FK attachment: a still-loose table joins the family holding a strict
+///    majority of its FK edges, or a plurality when it also shares a name
+///    token with the family's seed. Runs a few passes so attachments chain.
+///
+/// Two loose tables joined only by a FK never form a group on their own —
+/// that keeps the whole schema from collapsing into one blob. Tables that
+/// never cluster are simply absent from the result.
+pub fn suggest_groups(names: &[String], edges: &[(usize, usize)]) -> Vec<SuggestedGroup> {
+    let n = names.len();
+    let toks: Vec<Vec<String>> = names.iter().map(|s| name_tokens(s)).collect();
+
+    // Longest strict token-prefix parent, resolved to its root seed
+    // (token count strictly decreases along parents, so this terminates).
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i != j
+                && !toks[j].is_empty()
+                && toks[i].len() > toks[j].len()
+                && toks[i][..toks[j].len()] == toks[j][..]
+                && parent[i].is_none_or(|p| toks[j].len() > toks[p].len())
+            {
+                parent[i] = Some(j);
+            }
+        }
+    }
+    let root = |mut i: usize| -> usize {
+        while let Some(p) = parent[i] {
+            i = p;
+        }
+        i
+    };
+    let mut family: Vec<Option<usize>> = (0..n).map(|i| parent[i].map(|_| root(i))).collect();
+
+    let is_seed = |family: &[Option<usize>], i: usize| family.iter().any(|f| *f == Some(i));
+
+    for _ in 0..3 {
+        let mut changed = false;
+        for i in 0..n {
+            if family[i].is_some() || is_seed(&family, i) {
+                continue;
+            }
+            let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut total = 0usize;
+            for &(a, b) in edges {
+                let other = match (a == i, b == i) {
+                    (true, false) => b,
+                    (false, true) => a,
+                    _ => continue,
+                };
+                total += 1;
+                if let Some(r) = family[other] {
+                    *counts.entry(r).or_default() += 1;
+                } else if is_seed(&family, other) {
+                    *counts.entry(other).or_default() += 1;
+                }
+            }
+            // Ties keep the smallest root: deterministic output.
+            let mut best: Option<(usize, usize)> = None; // (count, root)
+            for (&r, &c) in &counts {
+                if best.is_none_or(|(bc, _)| c > bc) {
+                    best = Some((c, r));
+                }
+            }
+            let Some((cnt, r)) = best else { continue };
+            let similar = toks[i].iter().any(|t| toks[r].contains(t));
+            if cnt * 2 > total || similar {
+                family[i] = Some(r);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut seeds: Vec<usize> = family.iter().flatten().copied().collect();
+    seeds.sort_unstable();
+    seeds.dedup();
+    seeds
+        .into_iter()
+        .map(|s| {
+            let mut tables = vec![s];
+            tables.extend((0..n).filter(|&i| family[i] == Some(s)));
+            SuggestedGroup { name: names[s].clone(), tables }
+        })
+        .collect()
+}
+
+/// The table part of a "schema.name" layout key.
+pub fn bare_table_name(key: &str) -> &str {
+    key.split_once('.').map_or(key, |(_, n)| n)
+}
+
+/// A `TableGroup` member reference for a layout key: bare for the default
+/// schema, schema-qualified otherwise.
+pub fn table_ref_from_key(key: &str) -> String {
+    match key.split_once('.') {
+        Some((schema, name)) if schema == dbml_rs::DEFAULT_SCHEMA => quote_ident(name),
+        Some((schema, name)) => format!("{}.{}", quote_ident(schema), quote_ident(name)),
+        None => quote_ident(key),
+    }
+}
+
+/// Render suggested groups as TableGroup blocks. `ident` turns a table index
+/// into its DBML reference; `taken` holds names already in use (suffixed on
+/// collision) and is updated with the names actually emitted.
+pub fn render_table_groups(
+    groups: &[SuggestedGroup],
+    ident: impl Fn(usize) -> String,
+    taken: &mut HashSet<String>,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    for g in groups {
+        let mut name = g.name.clone();
+        let mut k = 2;
+        while !taken.insert(name.clone()) {
+            name = format!("{}_{k}", g.name);
+            k += 1;
+        }
+        let _ = writeln!(out, "TableGroup {} {{", quote_ident(&name));
+        for &ti in &g.tables {
+            let _ = writeln!(out, "  {}", ident(ti));
+        }
+        let _ = writeln!(out, "}}\n");
+    }
+    out
 }
 
 fn composition(cols: &[String]) -> String {
@@ -668,6 +862,104 @@ mod tests {
         assert!(src.contains("Table users {"));
         let m = parse(&src).unwrap();
         assert!(m.groups.is_empty(), "single schema seeds no real groups");
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn suggest_groups_prefix_families() {
+        let n = names(&["order", "order_item", "orderItemTax", "customer"]);
+        let groups = suggest_groups(&n, &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "order");
+        assert_eq!(groups[0].tables, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn suggest_groups_fk_majority_attaches() {
+        // shipment's only FK points into the order family → it joins;
+        // customer has no edges and stays loose.
+        let n = names(&["order", "order_item", "shipment", "customer"]);
+        let groups = suggest_groups(&n, &[(1, 0), (2, 0)]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tables, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn suggest_groups_no_majority_no_name_tie_stays_loose() {
+        // audit references both families evenly and shares no tokens.
+        let n = names(&["order", "order_item", "user", "user_role", "audit"]);
+        let groups = suggest_groups(&n, &[(4, 0), (4, 2)]);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| !g.tables.contains(&4)));
+    }
+
+    #[test]
+    fn suggest_groups_fk_pair_alone_is_not_a_group() {
+        let n = names(&["invoice", "customer"]);
+        assert!(suggest_groups(&n, &[(0, 1)]).is_empty());
+    }
+
+    #[test]
+    fn render_table_groups_suffixes_taken_names() {
+        let groups = vec![SuggestedGroup { name: "order".into(), tables: vec![0, 1] }];
+        let mut taken: HashSet<String> = ["order".to_owned()].into();
+        let n = names(&["order", "order_item"]);
+        let out = render_table_groups(&groups, |i| n[i].clone(), &mut taken);
+        assert!(out.contains("TableGroup order_2 {"));
+        assert!(out.contains("  order_item"));
+    }
+
+    #[test]
+    fn seed_user_area_pregroups_single_schema() {
+        use crate::db::structure::{ColumnInfo, FkInfo, KeyInfo};
+        let table = |name: &str, fks: Vec<FkInfo>| TableStructure {
+            schema: "public".into(),
+            name: name.into(),
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                type_name: "integer".into(),
+                not_null: true,
+                default: None,
+                identity: IdentityKind::None,
+                generated: false,
+                default_constraint: None,
+            }],
+            primary_key: Some(KeyInfo { name: None, columns: vec!["id".into()] }),
+            foreign_keys: fks,
+            indexes: vec![],
+            checks: vec![],
+        };
+        let fk = |to: &str| FkInfo {
+            name: String::new(),
+            columns: vec!["id".into()],
+            ref_schema: "public".into(),
+            ref_table: to.into(),
+            ref_columns: vec!["id".into()],
+            on_delete: String::new(),
+            on_update: String::new(),
+        };
+        let src = generate_document(
+            &[
+                table("order", vec![]),
+                table("order_item", vec![fk("order")]),
+                table("shipment", vec![fk("order")]),
+            ],
+            "db",
+        );
+        let m = parse(&src).expect("seeded document should parse");
+        assert_eq!(m.groups.len(), 1);
+        assert_eq!(m.groups[0].name, "order");
+        assert_eq!(m.groups[0].tables.len(), 3);
+    }
+
+    #[test]
+    fn table_ref_from_key_qualifies_non_default_schema() {
+        assert_eq!(table_ref_from_key("public.users"), "users");
+        assert_eq!(table_ref_from_key("auth.users"), "auth.users");
+        assert_eq!(table_ref_from_key("auth.user table"), "auth.\"user table\"");
     }
 
     #[test]

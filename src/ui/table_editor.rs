@@ -15,6 +15,11 @@ pub enum TableEditorAction {
     CancelInsert,
     CommitInsert { values: RowChanges },
     CommitPending { updates: Vec<(PkValues, RowChanges)>, deletes: Vec<PkValues> },
+    /// Re-fetch page 0 with the current filter/sort.
+    ApplyFilter,
+    /// Open the referenced table filtered to the referenced row.
+    GoToFk { schema: String, table: String, column: String, value: Value },
+    ViewCell { title: String, content: String },
 }
 
 fn icon_button(
@@ -73,7 +78,11 @@ fn build_commit_payload(
     Some((updates, deletes))
 }
 
-pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
+pub fn draw(
+    ui: &mut egui::Ui,
+    tab: &mut TableEditorTab,
+    hover_fk: &mut Option<super::FkHoverCell>,
+) -> TableEditorAction {
     let mut action = TableEditorAction::None;
 
     let has_pk = tab.table_schema.as_ref().map(|s| s.has_primary_key()).unwrap_or(false);
@@ -159,6 +168,40 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
         }
     });
 
+    // Filter row: raw WHERE clause + active-sort indicator.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("WHERE").small().monospace());
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut tab.filter)
+                .hint_text("e.g. status = 'active' AND total > 100")
+                .desired_width(320.0),
+        );
+        let dirty = tab.filter.trim() != tab.applied_filter.trim();
+        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let apply_clicked = ui
+            .add_enabled(dirty, egui::Button::new("Apply"))
+            .on_hover_text("Apply filter (Enter)")
+            .clicked();
+        if entered || apply_clicked {
+            action = TableEditorAction::ApplyFilter;
+        }
+        let any_filter = !tab.applied_filter.trim().is_empty()
+            || tab.col_filters.values().any(|v| !v.trim().is_empty());
+        if any_filter && ui.button("✖ Clear").on_hover_text("Clear all filters").clicked() {
+            tab.filter.clear();
+            tab.col_filters.clear();
+            action = TableEditorAction::ApplyFilter;
+        }
+        if let Some((col, desc)) = &tab.sort {
+            ui.separator();
+            ui.weak(format!("sorted by {col} {}", if *desc { "▼" } else { "▲" }));
+            if ui.small_button("✖").on_hover_text("Clear sort").clicked() {
+                tab.sort = None;
+                action = TableEditorAction::ApplyFilter;
+            }
+        }
+    });
+
     match &tab.status {
         TabStatus::Idle => {}
         TabStatus::Running(msg) => {
@@ -199,6 +242,13 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
     let mut begin_edit: Option<CellEdit> = None;
     let mut cancel_edit = false;
     let mut click_select: Option<(usize, egui::Modifiers)> = None;
+    let mut sort_click: Option<String> = None;
+    let mut filter_apply = false;
+    let mut ctx_action: Option<TableEditorAction> = None;
+    let mut fk_hover: Option<super::FkHoverCell> = None;
+    let current_sort = tab.sort.clone();
+    let fks = tab.fks.clone();
+    let insert_target = format!("{}.{}", tab.schema, tab.table);
 
     const INDEX_COL_W: f32 = 50.0;
     const DATA_COL_W: f32 = 140.0;
@@ -225,23 +275,56 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
             }
 
             builder
-                .header(22.0, |mut h| {
+                .header(46.0, |mut h| {
             h.col(|ui| {
                 ui.strong("");
             });
             for c in &rs.columns {
                 h.col(|ui| {
-                    let is_pk = tab
-                        .table_schema
-                        .as_ref()
-                        .map(|s| s.primary_key.iter().any(|pk| pk == &c.name))
-                        .unwrap_or(false);
-                    let label = if is_pk {
-                        format!("🔑 {}", c.name)
-                    } else {
-                        c.name.clone()
-                    };
-                    ui.strong(label).on_hover_text(&c.type_name);
+                    ui.vertical(|ui| {
+                        let is_pk = tab
+                            .table_schema
+                            .as_ref()
+                            .map(|s| s.primary_key.iter().any(|pk| pk == &c.name))
+                            .unwrap_or(false);
+                        let mut label = if is_pk {
+                            format!("🔑 {}", c.name)
+                        } else {
+                            c.name.clone()
+                        };
+                        match &current_sort {
+                            Some((col, false)) if col == &c.name => label.push_str(" ▲"),
+                            Some((col, true)) if col == &c.name => label.push_str(" ▼"),
+                            _ => {}
+                        }
+                        let resp = ui.add(
+                            egui::Label::new(egui::RichText::new(label).strong())
+                                .selectable(false)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        if resp
+                            .on_hover_text(format!("{} — click to sort", c.type_name))
+                            .clicked()
+                        {
+                            sort_click = Some(c.name.clone());
+                        }
+                        // Per-column quick filter; the column name is quoted
+                        // when building SQL, so case-sensitive names work.
+                        let entry = tab.col_filters.entry(c.name.clone()).or_default();
+                        let te = ui.add(
+                            egui::TextEdit::singleline(entry)
+                                .id(egui::Id::new(("col_filter", tab.id, &c.name)))
+                                .hint_text("filter")
+                                .font(egui::TextStyle::Small)
+                                .desired_width(ui.available_width()),
+                        );
+                        if te.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            filter_apply = true;
+                        }
+                    });
                 });
             }
         })
@@ -327,12 +410,21 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
                             }
                         } else {
                             let is_null = matches!(display_v, Value::Null);
+                            // Single-column FK on this column → tint like a
+                            // link; dwelling on it previews the referenced row.
+                            let fk_link = (!is_null && !is_deleted)
+                                .then(|| fks.iter().find(|f| f.from_column == *col_name))
+                                .flatten();
                             let s = display_v.display();
                             let preview: String = s.chars().take(200).collect();
                             let rich = if is_deleted {
                                 egui::RichText::new(preview).monospace().color(delete_fg).strikethrough()
                             } else if is_null {
                                 egui::RichText::new(preview).monospace().italics().color(null_fg)
+                            } else if fk_link.is_some() {
+                                egui::RichText::new(preview)
+                                    .monospace()
+                                    .color(ui.visuals().hyperlink_color)
                             } else {
                                 egui::RichText::new(preview).monospace()
                             };
@@ -340,7 +432,24 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
                                 ui.available_size(),
                                 egui::Label::new(rich).selectable(false).sense(egui::Sense::click()),
                             );
-                            let resp = resp.on_hover_text(s);
+                            // FK cells get the hover preview instead of the
+                            // full-value tooltip.
+                            let resp = if fk_link.is_some() {
+                                resp
+                            } else {
+                                resp.on_hover_text(s)
+                            };
+                            if let Some(fk) = fk_link {
+                                if resp.hovered() {
+                                    fk_hover = Some(super::FkHoverCell {
+                                        schema: fk.to_schema.clone(),
+                                        table: fk.to_table.clone(),
+                                        column: fk.to_column.clone(),
+                                        value: display_v.clone(),
+                                        rect: resp.rect,
+                                    });
+                                }
+                            }
                             if resp.clicked() {
                                 let mods = ui.input(|inp| inp.modifiers);
                                 click_select = Some((i, mods));
@@ -353,6 +462,50 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
                                     focus_set: false,
                                 });
                             }
+                            resp.context_menu(|ui| {
+                                // FK navigation for single-column FKs.
+                                if let Some(fk) =
+                                    fks.iter().find(|f| f.from_column == *col_name)
+                                {
+                                    if !matches!(display_v, Value::Null)
+                                        && ui
+                                            .button(format!(
+                                                "➡ Go to {}.{}",
+                                                fk.to_table, fk.to_column
+                                            ))
+                                            .clicked()
+                                    {
+                                        ctx_action = Some(TableEditorAction::GoToFk {
+                                            schema: fk.to_schema.clone(),
+                                            table: fk.to_table.clone(),
+                                            column: fk.to_column.clone(),
+                                            value: display_v.clone(),
+                                        });
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                }
+                                let mut grid_action =
+                                    super::results_grid::GridAction::None;
+                                super::results_grid::cell_context_menu(
+                                    ui,
+                                    rs,
+                                    i,
+                                    col_idx,
+                                    &insert_target,
+                                    &mut grid_action,
+                                );
+                                if let super::results_grid::GridAction::ViewCell {
+                                    title,
+                                    content,
+                                } = grid_action
+                                {
+                                    ctx_action = Some(TableEditorAction::ViewCell {
+                                        title,
+                                        content,
+                                    });
+                                }
+                            });
                         }
                     });
                 }
@@ -375,6 +528,22 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut TableEditorTab) -> TableEditorAction {
             .or_default()
             .insert(column, new_value);
     }
+    if let Some(col) = sort_click {
+        // Cycle: unsorted → ascending → descending → unsorted.
+        tab.sort = match &tab.sort {
+            Some((c, false)) if c == &col => Some((col, true)),
+            Some((c, true)) if c == &col => None,
+            _ => Some((col, false)),
+        };
+        action = TableEditorAction::ApplyFilter;
+    }
+    if filter_apply {
+        action = TableEditorAction::ApplyFilter;
+    }
+    if let Some(a) = ctx_action {
+        action = a;
+    }
+    *hover_fk = fk_hover;
 
     action
 }
@@ -426,7 +595,7 @@ fn build_changes_from_draft(draft: &BTreeMap<String, String>, schema: &TableSche
     changes
 }
 
-fn guess_from_type(type_name: &str) -> Option<Value> {
+pub fn guess_from_type(type_name: &str) -> Option<Value> {
     let t = type_name.to_ascii_lowercase();
     if t.contains("int") {
         Some(Value::Int(0))

@@ -15,7 +15,7 @@ const MIN_W: f32 = 160.0;
 const MAX_W: f32 = 340.0;
 const GROUP_PAD: f32 = 24.0;
 const GROUP_LABEL_H: f32 = 20.0;
-const ZOOM_MIN: f32 = 0.15;
+const ZOOM_MIN: f32 = 0.02;
 const ZOOM_MAX: f32 = 3.0;
 /// Seconds of pan/zoom quiet before the layout sidecar is flushed.
 const LAYOUT_FLUSH_AFTER: f64 = 0.7;
@@ -196,10 +196,17 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
         }
     }
 
-    // --- Zoom at cursor -----------------------------------------------------
+    // --- Wheel pans, ctrl+wheel / pinch zooms at cursor ---------------------
     if ui.rect_contains_pointer(canvas_rect) {
-        let (scroll, zoom_delta) = ui.input(|i| (i.raw_scroll_delta.y, i.zoom_delta()));
-        let factor = if zoom_delta != 1.0 { zoom_delta } else { (scroll * 0.003).exp() };
+        // smooth_scroll_delta excludes ctrl+wheel (egui diverts that into
+        // zoom_delta) and folds shift+wheel into a horizontal delta.
+        let (scroll, factor) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+        if scroll != Vec2::ZERO {
+            tab.layout.pan.0 += scroll.x;
+            tab.layout.pan.1 += scroll.y;
+            tab.mark_layout_dirty(now);
+            ui.ctx().request_repaint();
+        }
         if factor != 1.0
             && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
         {

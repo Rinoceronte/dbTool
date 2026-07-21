@@ -47,6 +47,19 @@ const MYSQL: &[FuncSig] = &[
     FuncSig { name: "UNIX_TIMESTAMP", signature: "UNIX_TIMESTAMP(d?) → bigint" },
 ];
 
+const SQLITE: &[FuncSig] = &[
+    FuncSig { name: "IFNULL",        signature: "IFNULL(a, b) → any" },
+    FuncSig { name: "IIF",           signature: "IIF(cond, x, y) → any" },
+    FuncSig { name: "GROUP_CONCAT",  signature: "GROUP_CONCAT(expr, sep?) → text" },
+    FuncSig { name: "STRFTIME",      signature: "STRFTIME(fmt, ts, mod…) → text" },
+    FuncSig { name: "DATETIME",      signature: "DATETIME(ts, mod…) → text" },
+    FuncSig { name: "DATE",          signature: "DATE(ts, mod…) → text" },
+    FuncSig { name: "JSON_EXTRACT",  signature: "JSON_EXTRACT(json, path) → any" },
+    FuncSig { name: "TYPEOF",        signature: "TYPEOF(expr) → text" },
+    FuncSig { name: "RANDOM",        signature: "RANDOM() → integer" },
+    FuncSig { name: "LAST_INSERT_ROWID", signature: "LAST_INSERT_ROWID() → integer" },
+];
+
 const MSSQL: &[FuncSig] = &[
     FuncSig { name: "ISNULL",     signature: "ISNULL(a, b) → any" },
     FuncSig { name: "IIF",        signature: "IIF(cond, x, y) → any" },
@@ -65,6 +78,7 @@ pub fn functions(dialect: DbKind) -> impl Iterator<Item = &'static FuncSig> {
         DbKind::Postgres => POSTGRES,
         DbKind::MySql => MYSQL,
         DbKind::MsSql => MSSQL,
+        DbKind::Sqlite => SQLITE,
     };
     COMMON.iter().chain(extra.iter())
 }

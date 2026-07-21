@@ -22,7 +22,7 @@ impl Default for ImportOptions {
 
 pub fn quote_ident(kind: DbKind, name: &str) -> String {
     match kind {
-        DbKind::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        DbKind::Postgres | DbKind::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
         DbKind::MySql => format!("`{}`", name.replace('`', "``")),
         DbKind::MsSql => format!("[{}]", name.replace(']', "]]")),
     }
@@ -32,7 +32,9 @@ pub fn quote_literal(kind: DbKind, s: &str) -> String {
     match kind {
         // MySQL treats backslash as an escape character by default.
         DbKind::MySql => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
-        DbKind::Postgres | DbKind::MsSql => format!("'{}'", s.replace('\'', "''")),
+        DbKind::Postgres | DbKind::MsSql | DbKind::Sqlite => {
+            format!("'{}'", s.replace('\'', "''"))
+        }
     }
 }
 

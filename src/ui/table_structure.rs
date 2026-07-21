@@ -724,6 +724,7 @@ fn draw_form(ui: &mut egui::Ui, tab: &mut TableEditorTab, ops: &mut Vec<TreeOp>)
                             DbKind::Postgres => "Auto increment (identity)",
                             DbKind::MySql => "Auto increment (AUTO_INCREMENT)",
                             DbKind::MsSql => "Auto increment (IDENTITY)",
+                            DbKind::Sqlite => "Auto increment (AUTOINCREMENT)",
                         };
                         let mut auto = c.identity != IdentityKind::None;
                         let auto_resp = ui.add_enabled(

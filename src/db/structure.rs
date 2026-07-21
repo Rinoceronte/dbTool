@@ -47,6 +47,7 @@ impl IdentityKind {
             DbKind::Postgres => &[IdentityKind::None, IdentityKind::ByDefault, IdentityKind::Always],
             DbKind::MySql => &[IdentityKind::None, IdentityKind::AutoIncrement],
             DbKind::MsSql => &[IdentityKind::None, IdentityKind::MsIdentity],
+            DbKind::Sqlite => &[IdentityKind::None, IdentityKind::AutoIncrement],
         }
     }
 }
@@ -558,6 +559,7 @@ fn default_type(kind: DbKind) -> &'static str {
         DbKind::Postgres => "text",
         DbKind::MySql => "varchar(255)",
         DbKind::MsSql => "nvarchar(255)",
+        DbKind::Sqlite => "TEXT",
     }
 }
 
@@ -596,6 +598,7 @@ pub fn base_type_suggestions(kind: DbKind) -> &'static [&'static str] {
             "smallint", "time", "tinyint", "uniqueidentifier", "varbinary",
             "varchar",
         ],
+        DbKind::Sqlite => &["ANY", "BLOB", "INTEGER", "NUMERIC", "REAL", "TEXT"],
     }
 }
 
@@ -635,7 +638,7 @@ pub fn join_type(base: &str, params: &str) -> String {
 pub fn default_identity(kind: DbKind) -> IdentityKind {
     match kind {
         DbKind::Postgres => IdentityKind::ByDefault,
-        DbKind::MySql => IdentityKind::AutoIncrement,
+        DbKind::MySql | DbKind::Sqlite => IdentityKind::AutoIncrement,
         DbKind::MsSql => IdentityKind::MsIdentity,
     }
 }
@@ -680,7 +683,7 @@ pub fn script(stmts: &[DdlStatement]) -> String {
 
 fn qi(kind: DbKind, name: &str) -> String {
     match kind {
-        DbKind::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        DbKind::Postgres | DbKind::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
         DbKind::MySql => format!("`{}`", name.replace('`', "``")),
         DbKind::MsSql => format!("[{}]", name.replace(']', "]]")),
     }
@@ -734,6 +737,16 @@ fn column_def(kind: DbKind, c: &WorkingColumn) -> String {
             if c.identity == IdentityKind::MsIdentity {
                 def.push_str(" IDENTITY(1,1)");
             }
+            if c.not_null {
+                def.push_str(" NOT NULL");
+            }
+            if let Some(d) = norm(&c.default) {
+                def.push_str(&format!(" DEFAULT {d}"));
+            }
+        }
+        DbKind::Sqlite => {
+            // AUTOINCREMENT is only legal as INTEGER PRIMARY KEY AUTOINCREMENT;
+            // create_table_sql appends it via the PK clause, not here.
             if c.not_null {
                 def.push_str(" NOT NULL");
             }
@@ -817,9 +830,20 @@ fn type_change_note(old: &str, new: &str) -> Option<&'static str> {
     }
 }
 
+/// DROP TABLE, used by compare-driven migration scripts for tables that
+/// exist only on the target side.
+pub fn drop_table_stmt(kind: DbKind, schema: &str, table: &str) -> DdlStatement {
+    DdlStatement {
+        sql: format!("DROP TABLE {}", qtable(kind, schema, table)),
+        danger: Danger::Destructive,
+        note: Some("destructive — table and data are lost"),
+    }
+}
+
 pub fn generate(wt: &WorkingTable) -> Vec<DdlStatement> {
     match &wt.original_name {
         None => generate_create(wt),
+        Some(orig) if wt.kind == DbKind::Sqlite => generate_alter_sqlite(wt, orig),
         Some(orig) => generate_alter(wt, orig),
     }
 }
@@ -829,10 +853,32 @@ fn generate_create(wt: &WorkingTable) -> Vec<DdlStatement> {
     let tbl = qtable(kind, &wt.schema, &wt.name);
     let mut parts: Vec<String> = Vec::new();
 
+    // SQLite AUTOINCREMENT only exists as `INTEGER PRIMARY KEY AUTOINCREMENT`
+    // on the column itself, replacing the table-level PK clause.
+    let sqlite_autoinc_pk = kind == DbKind::Sqlite
+        && wt.pk.present
+        && wt.pk.column_ids.len() == 1
+        && wt
+            .columns
+            .iter()
+            .any(|c| {
+                !c.dropped
+                    && Some(c.id) == wt.pk.column_ids.first().copied()
+                    && c.identity == IdentityKind::AutoIncrement
+            });
+
     for c in wt.columns.iter().filter(|c| !c.dropped) {
+        if sqlite_autoinc_pk && Some(c.id) == wt.pk.column_ids.first().copied() {
+            let mut def = format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", qi(kind, &c.name));
+            if c.not_null {
+                def.push_str(" NOT NULL");
+            }
+            parts.push(format!("    {def}"));
+            continue;
+        }
         parts.push(format!("    {}", column_def(kind, c)));
     }
-    if wt.pk.present && !wt.pk.column_ids.is_empty() {
+    if wt.pk.present && !wt.pk.column_ids.is_empty() && !sqlite_autoinc_pk {
         let cols = quoted_list(kind, &ids_to_names(wt, &wt.pk.column_ids));
         if wt.pk.name.trim().is_empty() || kind == DbKind::MySql {
             parts.push(format!("    PRIMARY KEY ({cols})"));
@@ -914,7 +960,9 @@ fn create_index_sql(wt: &WorkingTable, ix: &WorkingIndex, table: &str) -> Option
 
 fn drop_index_sql(kind: DbKind, schema: &str, table: &str, name: &str) -> String {
     match kind {
-        DbKind::Postgres => format!("DROP INDEX {}.{}", qi(kind, schema), qi(kind, name)),
+        DbKind::Postgres | DbKind::Sqlite => {
+            format!("DROP INDEX {}.{}", qi(kind, schema), qi(kind, name))
+        }
         DbKind::MySql | DbKind::MsSql => format!(
             "DROP INDEX {} ON {}",
             qi(kind, name),
@@ -1132,6 +1180,8 @@ fn generate_alter(wt: &WorkingTable, orig_table: &str) -> Vec<DdlStatement> {
                     }
                 }
             }
+            // SQLite goes through generate_alter_sqlite, never here.
+            DbKind::Sqlite => unreachable!(),
         }
     }
 
@@ -1203,7 +1253,9 @@ fn generate_alter(wt: &WorkingTable, orig_table: &str) -> Vec<DdlStatement> {
     // 13. Rename table, last so everything above targets the old name.
     if wt.table_renamed() {
         let sql = match kind {
-            DbKind::Postgres => format!("ALTER TABLE {tbl} RENAME TO {}", qi(kind, &wt.name)),
+            DbKind::Postgres | DbKind::Sqlite => {
+                format!("ALTER TABLE {tbl} RENAME TO {}", qi(kind, &wt.name))
+            }
             DbKind::MySql => format!(
                 "RENAME TABLE {tbl} TO {}",
                 qtable(kind, &wt.schema, &wt.name)
@@ -1213,6 +1265,137 @@ fn generate_alter(wt: &WorkingTable, orig_table: &str) -> Vec<DdlStatement> {
         out.push(DdlStatement::safe(sql));
     }
 
+    out
+}
+
+/// SQLite has no ALTER COLUMN and no ADD/DROP CONSTRAINT. Changes it does
+/// support (rename table, rename/add/drop column, index add/drop) become
+/// direct statements; anything else (type/null/default edits, PK/FK/check
+/// changes) triggers the canonical table rebuild: CREATE a new table under a
+/// temporary name, INSERT…SELECT the rows across, DROP the old table, RENAME.
+fn generate_alter_sqlite(wt: &WorkingTable, orig_table: &str) -> Vec<DdlStatement> {
+    let kind = wt.kind;
+    let needs_rebuild = wt.pk.state() != ChangeState::Unchanged
+        || wt.foreign_keys.iter().any(|f| f.state() != ChangeState::Unchanged)
+        || wt.checks.iter().any(|c| c.state() != ChangeState::Unchanged)
+        || wt.columns.iter().any(|c| {
+            let Some(o) = &c.origin else { return false };
+            !c.dropped
+                && (c.type_name != o.type_name
+                    || c.not_null != o.not_null
+                    || norm(&c.default) != norm_opt(&o.default)
+                    || c.identity != o.identity)
+        });
+
+    let tbl = qtable(kind, &wt.schema, orig_table);
+    let mut out: Vec<DdlStatement> = Vec::new();
+
+    if !needs_rebuild {
+        for ix in &wt.indexes {
+            let st = ix.state();
+            if let Some(o) = &ix.origin {
+                if st == ChangeState::Dropped || st == ChangeState::Modified {
+                    out.push(DdlStatement::safe(drop_index_sql(kind, &wt.schema, orig_table, &o.name)));
+                }
+            }
+        }
+        for c in wt.columns.iter().filter(|c| c.dropped && c.origin.is_some()) {
+            let o = c.origin.as_ref().unwrap();
+            out.push(DdlStatement {
+                sql: format!("ALTER TABLE {tbl} DROP COLUMN {}", qi(kind, &o.name)),
+                danger: Danger::Destructive,
+                note: Some("destructive — column data is lost"),
+            });
+        }
+        for c in wt.columns.iter().filter(|c| !c.dropped) {
+            if let Some(o) = &c.origin {
+                if c.name != o.name {
+                    out.push(DdlStatement::safe(format!(
+                        "ALTER TABLE {tbl} RENAME COLUMN {} TO {}",
+                        qi(kind, &o.name),
+                        qi(kind, &c.name)
+                    )));
+                }
+            }
+        }
+        for c in wt.columns.iter().filter(|c| !c.dropped && c.origin.is_none()) {
+            let lossy = c.not_null && norm(&c.default).is_none();
+            out.push(DdlStatement {
+                sql: format!("ALTER TABLE {tbl} ADD COLUMN {}", column_def(kind, c)),
+                danger: if lossy { Danger::Lossy } else { Danger::Safe },
+                note: lossy.then_some("SQLite requires a default for NOT NULL ADD COLUMN on non-empty tables"),
+            });
+        }
+        for ix in &wt.indexes {
+            let st = ix.state();
+            if st == ChangeState::Added || st == ChangeState::Modified {
+                if let Some(stmt) = create_index_sql(wt, ix, orig_table) {
+                    out.push(DdlStatement {
+                        sql: stmt,
+                        danger: if ix.unique { Danger::Lossy } else { Danger::Safe },
+                        note: ix.unique.then_some("unique — fails on duplicate values"),
+                    });
+                }
+            }
+        }
+        if wt.table_renamed() {
+            out.push(DdlStatement::safe(format!(
+                "ALTER TABLE {tbl} RENAME TO {}",
+                qi(kind, &wt.name)
+            )));
+        }
+        return out;
+    }
+
+    // Rebuild path.
+    let tmp_name = format!("{}__new", wt.name);
+    let mut tmp_wt = wt.clone();
+    tmp_wt.name = tmp_name.clone();
+    tmp_wt.original_name = None;
+    let Some(create) = generate_create(&tmp_wt).into_iter().next() else {
+        return out;
+    };
+    out.push(DdlStatement {
+        sql: create.sql,
+        danger: Danger::Lossy,
+        note: Some("table rebuild — creates a new table and copies every row"),
+    });
+
+    let pairs: Vec<(&str, &str)> = wt
+        .columns
+        .iter()
+        .filter(|c| !c.dropped && c.origin.is_some())
+        .map(|c| (c.name.as_str(), c.origin.as_ref().unwrap().name.as_str()))
+        .collect();
+    if !pairs.is_empty() {
+        let new_cols: Vec<String> = pairs.iter().map(|(n, _)| qi(kind, n)).collect();
+        let old_cols: Vec<String> = pairs.iter().map(|(_, o)| qi(kind, o)).collect();
+        out.push(DdlStatement::safe(format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {tbl}",
+            qtable(kind, &wt.schema, &tmp_name),
+            new_cols.join(", "),
+            old_cols.join(", "),
+        )));
+    }
+    out.push(DdlStatement {
+        sql: format!("DROP TABLE {tbl}"),
+        danger: Danger::Destructive,
+        note: Some("old table dropped after the copy"),
+    });
+    out.push(DdlStatement::safe(format!(
+        "ALTER TABLE {} RENAME TO {}",
+        qtable(kind, &wt.schema, &tmp_name),
+        qi(kind, &wt.name)
+    )));
+    for ix in wt.indexes.iter().filter(|i| !i.dropped) {
+        if let Some(stmt) = create_index_sql(wt, ix, &wt.name) {
+            out.push(DdlStatement {
+                sql: stmt,
+                danger: if ix.unique { Danger::Lossy } else { Danger::Safe },
+                note: ix.unique.then_some("unique — fails on duplicate values"),
+            });
+        }
+    }
     out
 }
 

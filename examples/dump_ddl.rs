@@ -19,8 +19,9 @@ async fn main() {
         username: user.into(),
         password: password.into(),
         require_ssl: false,
+        ssh: None,
     };
-    let driver = db::connect(&params).await.expect("connect");
+    let (driver, _tunnel) = db::connect(&params).await.expect("connect");
     let (files, errors) = dbtool::runtime::dump_ddl(driver, vec![], &out).await.expect("dump");
     println!("wrote {files} file(s), {} error(s)", errors.len());
     for e in errors {

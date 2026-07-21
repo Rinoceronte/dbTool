@@ -25,6 +25,32 @@ pub struct ConnectionProfile {
     /// Skipped from the JSON output when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_fallback: Option<String>,
+    /// Additional server databases toggled on for this connection; each opens
+    /// its own connection and appears as a node in the sidebar tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_databases: Vec<String>,
+    // SSH tunnel (system ssh; keys/agent/~/.ssh/config apply as usual).
+    #[serde(default)]
+    pub ssh_enabled: bool,
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default = "default_ssh_port")]
+    pub ssh_port: u16,
+    #[serde(default)]
+    pub ssh_user: String,
+    /// Optional identity file; empty = ssh defaults.
+    #[serde(default)]
+    pub ssh_key: String,
+    /// Tint this connection red everywhere so prod is unmistakable.
+    #[serde(default)]
+    pub production: bool,
+    /// Refuse statements that can write, plus all editor/DDL commits.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 impl ConnectionProfile {
@@ -39,6 +65,14 @@ impl ConnectionProfile {
             username: String::new(),
             require_ssl: false,
             password_fallback: None,
+            enabled_databases: Vec::new(),
+            ssh_enabled: false,
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            ssh_key: String::new(),
+            production: false,
+            read_only: false,
         }
     }
 
@@ -51,6 +85,12 @@ impl ConnectionProfile {
             username: self.username.clone(),
             password,
             require_ssl: self.require_ssl,
+            ssh: self.ssh_enabled.then(|| crate::db::SshTunnelParams {
+                host: self.ssh_host.clone(),
+                port: self.ssh_port,
+                user: self.ssh_user.clone(),
+                key_path: self.ssh_key.clone(),
+            }),
         }
     }
 }
