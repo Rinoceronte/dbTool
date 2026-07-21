@@ -299,14 +299,26 @@ pub fn draw(
 
             ui.separator();
 
-            // Input + Send/Cancel
+            // Input + Send/Cancel. Plain Enter sends (consumed before the
+            // TextEdit can insert a newline); Shift+Enter inserts a newline;
+            // ⌘/Ctrl+Enter still sends for muscle memory.
             let busy = state.current_session.is_some();
-            let submit = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command_only());
+            let edit_id = egui::Id::new("ai_panel_input");
+            let has_focus = ui.memory(|m| m.has_focus(edit_id));
+            let submit = !busy
+                && ((has_focus
+                    && ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    }))
+                    || ui.input(|i| {
+                        i.key_pressed(egui::Key::Enter) && i.modifiers.command_only()
+                    }));
             ui.add(
                 egui::TextEdit::multiline(&mut state.input)
+                    .id(edit_id)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Ask about the DB… (⌘/Ctrl+Enter to send)"),
+                    .hint_text("Ask about the DB… (Enter sends, Shift+Enter = newline)"),
             );
 
             ui.horizontal(|ui| {
