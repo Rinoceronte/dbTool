@@ -64,6 +64,9 @@ pub enum DragKind {
 
 pub struct DiagramTab {
     pub id: TabId,
+    /// Set when this diagram is owned by a connection ("View as DBML"):
+    /// enables the Refresh-from-database action.
+    pub profile_id: Option<crate::ui::ProfileId>,
     pub path: PathBuf,
     pub text: String,
     pub saved_text: String,
@@ -98,6 +101,7 @@ impl DiagramTab {
         let want_fit = stored.is_none();
         Self {
             id,
+            profile_id: None,
             path,
             saved_text: text.clone(),
             last_parsed: text.clone(),
@@ -156,6 +160,8 @@ impl DiagramTab {
 pub enum DiagramAction {
     None,
     SaveFile,
+    /// Re-introspect the owning connection and merge into the source text.
+    RefreshFromDb,
     Status(String),
 }
 
@@ -192,6 +198,20 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) -> DiagramAction {
             tab.layout.tables.clear();
             tab.want_fit = true;
             tab.save_layout();
+        }
+        if tab.profile_id.is_some() {
+            ui.separator();
+            if ui
+                .button("⟳ Refresh from database")
+                .on_hover_text(
+                    "Re-introspect the connection and update the generated region. \
+                     Your TableGroups and edits below the marker are preserved; \
+                     nothing is written until you Ctrl+S.",
+                )
+                .clicked()
+            {
+                action = DiagramAction::RefreshFromDb;
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             match (&tab.parse_error, &tab.model) {

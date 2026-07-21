@@ -32,7 +32,8 @@ enum Pending {
     ApplyDdl(TabId),
     FetchDbMeta(Uuid),
     DumpDdl,
-    DumpDbml(Uuid), // profile id
+    DumpDbml(Uuid),     // profile id — first generation, creates the file
+    RefreshDbml(TabId), // merge fresh structure into an open diagram tab
     ImportCsv,
     ExportCsv,
     AuthStatus,
@@ -453,51 +454,61 @@ impl App {
             }
             Event::DbmlDumped { req, tables, errors } => {
                 let Some(op) = self.pending.remove(&req) else { return };
-                let Pending::DumpDbml(profile_id) = op else { return };
-                let name = self
-                    .find_active(profile_id)
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| "database".to_owned());
-                if tables.is_empty() {
-                    self.status = Some(format!(
-                        "View as DBML: no tables found in {name}{}",
-                        if errors.is_empty() { String::new() } else { format!(" ({} error(s))", errors.len()) }
-                    ));
-                    return;
-                }
-                let text = crate::dbml::generate(&tables, &name);
-                let dir = dirs::config_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("dbTool")
-                    .join("dbml");
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    self.status = Some(format!("Could not create {}: {e}", dir.display()));
-                    return;
-                }
-                let safe: String = name
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                    .collect();
-                let path = dir.join(format!("{safe}.dbml"));
-                if let Err(e) = std::fs::write(&path, &text) {
-                    self.status = Some(format!("Could not write {}: {e}", path.display()));
-                    return;
-                }
-                // Regeneration refreshes an already-open tab; the layout
-                // sidecar keys by schema.table, so positions survive.
-                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-                self.tabs
-                    .retain(|t| !matches!(t, Tab::Diagram(d) if d.path == canonical));
-                self.open_diagram_tab(path);
-                self.status = Some(if errors.is_empty() {
-                    format!("Generated DBML for {} table(s) from {name}", tables.len())
+                let skipped = if errors.is_empty() {
+                    String::new()
                 } else {
-                    format!(
-                        "Generated DBML for {} table(s) from {name} — {} object(s) skipped",
-                        tables.len(),
-                        errors.len()
-                    )
-                });
+                    format!(" — {} object(s) skipped", errors.len())
+                };
+                match op {
+                    // First generation: create the connection-owned document.
+                    Pending::DumpDbml(profile_id) => {
+                        let name = self
+                            .find_active(profile_id)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| "database".to_owned());
+                        if tables.is_empty() {
+                            self.status =
+                                Some(format!("View as DBML: no tables found in {name}{skipped}"));
+                            return;
+                        }
+                        let text = crate::dbml::generate_document(&tables, &name);
+                        let path = self.connection_dbml_path(profile_id, &name);
+                        if let Err(e) = std::fs::create_dir_all(Self::dbml_dir()) {
+                            self.status =
+                                Some(format!("Could not create {}: {e}", Self::dbml_dir().display()));
+                            return;
+                        }
+                        if let Err(e) = std::fs::write(&path, &text) {
+                            self.status =
+                                Some(format!("Could not write {}: {e}", path.display()));
+                            return;
+                        }
+                        self.open_diagram_tab(path, Some(profile_id));
+                        self.status = Some(format!(
+                            "Generated DBML for {} table(s) from {name}{skipped}",
+                            tables.len()
+                        ));
+                    }
+                    // Refresh: merge into the open tab's text; the user
+                    // persists it with Ctrl+S after reviewing.
+                    Pending::RefreshDbml(tab_id) => {
+                        let name = self
+                            .find_tab_mut(tab_id)
+                            .and_then(|t| match t {
+                                Tab::Diagram(d) => d.profile_id,
+                                _ => None,
+                            })
+                            .and_then(|pid| self.find_active(pid).map(|a| a.name.clone()))
+                            .unwrap_or_else(|| "database".to_owned());
+                        let Some(Tab::Diagram(d)) = self.find_tab_mut(tab_id) else { return };
+                        d.text = crate::dbml::merge_generated(&d.text, &tables, &name);
+                        self.status = Some(format!(
+                            "Refreshed {} table(s) from {name}{skipped} — Ctrl+S to keep",
+                            tables.len()
+                        ));
+                    }
+                    _ => {}
+                }
             }
             Event::ImportProgress { req, rows } => {
                 if let Some(Pending::ImportCsv) = self.pending.get(&req) {
@@ -632,7 +643,7 @@ impl App {
         self.active_tab = Some(id);
     }
 
-    fn open_diagram_tab(&mut self, path: std::path::PathBuf) {
+    fn open_diagram_tab(&mut self, path: std::path::PathBuf, profile_id: Option<Uuid>) {
         let path = path.canonicalize().unwrap_or(path);
         // Focus an existing tab if one already shows this file.
         if let Some(existing_id) = self
@@ -653,10 +664,54 @@ impl App {
         };
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let id = Uuid::new_v4();
-        self.tabs.push(Tab::Diagram(crate::ui::diagram_tab::DiagramTab::open(
-            id, path, text, mtime,
-        )));
+        let mut tab = crate::ui::diagram_tab::DiagramTab::open(id, path, text, mtime);
+        tab.profile_id = profile_id;
+        self.tabs.push(Tab::Diagram(tab));
         self.active_tab = Some(id);
+    }
+
+    fn dbml_dir() -> std::path::PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("dbTool")
+            .join("dbml")
+    }
+
+    /// The connection-owned DBML document. Identified by a short id suffix so
+    /// it survives connection renames; the readable part is just for humans.
+    fn connection_dbml_path(&self, profile_id: Uuid, name: &str) -> std::path::PathBuf {
+        let short = &profile_id.simple().to_string()[..8];
+        let dir = Self::dbml_dir();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let suffix = format!("-{short}.dbml");
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().ends_with(&suffix) {
+                    return e.path();
+                }
+            }
+        }
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        dir.join(format!("{safe}-{short}.dbml"))
+    }
+
+    fn refresh_diagram_from_db(&mut self, tab_id: TabId) {
+        let Some(Tab::Diagram(d)) = self.find_tab_mut(tab_id) else { return };
+        let Some(profile_id) = d.profile_id else { return };
+        let Some(ac) = self.find_active(profile_id) else {
+            self.status = Some(
+                "Refresh needs the owning connection to be connected".to_owned(),
+            );
+            return;
+        };
+        let conn = ac.conn_id;
+        self.status = Some(format!("Refreshing DBML from {}…", ac.name));
+        self.send(Pending::RefreshDbml(tab_id), move |req| Command::DumpDbml {
+            req,
+            conn,
+        });
     }
 
     fn save_diagram_file(&mut self, tab_id: TabId) {
@@ -978,7 +1033,7 @@ impl eframe::App for App {
         // DBML file picker.
         self.dbml_file_dialog.update(ctx);
         if let Some(picked) = self.dbml_file_dialog.take_selected() {
-            self.open_diagram_tab(picked);
+            self.open_diagram_tab(picked, None);
         }
 
         egui::SidePanel::left("sidebar")
@@ -1261,6 +1316,12 @@ impl eframe::App for App {
                                 app.save_diagram_file(tab_id);
                             }));
                         }
+                        DiagramAction::RefreshFromDb => {
+                            let tab_id = d.id;
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.refresh_diagram_from_db(tab_id);
+                            }));
+                        }
                         DiagramAction::Status(s) => {
                             pending_actions.push(Box::new(move |app: &mut Self| {
                                 app.status = Some(s);
@@ -1504,7 +1565,16 @@ impl App {
             T::ViewAsDbml(profile_id) => {
                 let Some(ac) = self.find_active(profile_id) else { return };
                 let conn = ac.conn_id;
-                self.status = Some(format!("Introspecting {} for DBML…", ac.name));
+                let name = ac.name.clone();
+                // The connection's document persists across sessions: open it
+                // if it exists (keeping the user's groups and edits); only
+                // introspect when there is nothing yet.
+                let path = self.connection_dbml_path(profile_id, &name);
+                if path.exists() {
+                    self.open_diagram_tab(path, Some(profile_id));
+                    return;
+                }
+                self.status = Some(format!("Introspecting {name} for DBML…"));
                 self.send(Pending::DumpDbml(profile_id), move |req| Command::DumpDbml {
                     req,
                     conn,
