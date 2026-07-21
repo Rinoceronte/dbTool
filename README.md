@@ -17,6 +17,18 @@ Supports **PostgreSQL**, **MySQL**, **Microsoft SQL Server**, and **SQLite**.
 - **Connections** — SSH tunnels, OS-keyring credential storage, auto-reconnect, session restore
 - **AI** — embedded Claude agent panel (via the `claude` CLI + in-process MCP server) that can inspect schemas and run queries
 
+## Installing
+
+Grab a prebuilt binary for Linux, Windows, or macOS (Intel & Apple Silicon) from the
+[Releases page](https://github.com/Rinoceronte/dbTool/releases) — unpack and run, no
+runtime dependencies beyond a desktop environment.
+
+Or build from source with a Rust toolchain:
+
+```sh
+cargo install --git https://github.com/Rinoceronte/dbTool
+```
+
 ## Building
 
 ```sh
