@@ -178,6 +178,33 @@ pub fn is_multi_statement(sql: &str) -> bool {
     split_statements(sql).len() > 1
 }
 
+/// First keyword of a statement, uppercased, skipping leading whitespace and
+/// `--` / `/* */` comments. Empty if the SQL has no content. Drivers classify
+/// row-returning vs. execute paths with this, so a leading comment must never
+/// change the classification.
+pub fn leading_keyword(sql: &str) -> String {
+    let mut s = sql.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = match rest.split_once('\n') {
+                Some((_, r)) => r.trim_start(),
+                None => "",
+            };
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            match rest.split_once("*/") {
+                Some((_, r)) => s = r.trim_start(),
+                None => return String::new(),
+            }
+        } else {
+            break;
+        }
+    }
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
 /// Does a fragment contain anything besides whitespace and comments?
 fn has_sql_content(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
@@ -933,6 +960,20 @@ pub async fn open_ssh_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leading_keyword_skips_comments() {
+        assert_eq!(leading_keyword("SELECT 1"), "SELECT");
+        assert_eq!(leading_keyword("  select 1"), "SELECT");
+        assert_eq!(leading_keyword("-- note\nSELECT 1"), "SELECT");
+        assert_eq!(leading_keyword("-- a\n-- b\nWITH x AS (SELECT 1) SELECT * FROM x"), "WITH");
+        assert_eq!(leading_keyword("/* block */ SELECT 1"), "SELECT");
+        assert_eq!(leading_keyword("/* multi\nline */\n-- and line\nEXPLAIN SELECT 1"), "EXPLAIN");
+        assert_eq!(leading_keyword("-- comment\nUPDATE t SET a = 1"), "UPDATE");
+        assert_eq!(leading_keyword("/* unterminated"), "");
+        assert_eq!(leading_keyword("-- only a comment"), "");
+        assert_eq!(leading_keyword(""), "");
+    }
 
     #[test]
     fn single_statement_is_not_multi() {

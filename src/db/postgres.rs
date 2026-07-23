@@ -82,11 +82,10 @@ impl PostgresDriver {
             }
             return Ok(sets);
         }
-        let trimmed = sql.trim_start().to_ascii_uppercase();
-        let is_select = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("SHOW")
-            || trimmed.starts_with("EXPLAIN");
+        let is_select = matches!(
+            super::leading_keyword(sql).as_str(),
+            "SELECT" | "WITH" | "SHOW" | "EXPLAIN"
+        );
         if is_select {
             use futures::TryStreamExt as _;
             let mut stream = sqlx::query(sql).fetch(&mut *conn);
@@ -419,11 +418,10 @@ impl Driver for PostgresDriver {
             }
             return Ok(rs);
         }
-        let trimmed = sql.trim_start().to_ascii_uppercase();
-        let is_select = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("SHOW")
-            || trimmed.starts_with("EXPLAIN");
+        let is_select = matches!(
+            super::leading_keyword(sql).as_str(),
+            "SELECT" | "WITH" | "SHOW" | "EXPLAIN"
+        );
         if is_select {
             use futures::TryStreamExt as _;
             let mut stream = sqlx::query(sql).fetch(&self.pool);

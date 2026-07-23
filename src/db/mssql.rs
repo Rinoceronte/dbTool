@@ -464,8 +464,7 @@ impl Driver for MsSqlDriver {
     }
 
     async fn query(&self, sql: &str) -> Result<ResultSet> {
-        let trimmed = sql.trim_start().to_ascii_uppercase();
-        let is_select = trimmed.starts_with("SELECT") || trimmed.starts_with("WITH");
+        let is_select = matches!(super::leading_keyword(sql).as_str(), "SELECT" | "WITH");
         let mut client = self.client.lock().await;
         // Scripts and SELECTs both go through simple_query — the whole batch
         // runs on this single session, so multi-statement scripts and

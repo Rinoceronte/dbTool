@@ -209,30 +209,12 @@ fn value_to_json(v: &Value) -> Json {
 }
 
 /// Best-effort check: does this SQL look like a read-only statement?
-/// Conservative — anything not on the allow-list is rejected.
+/// Conservative — anything not on the allow-list is rejected. Uses the same
+/// keyword detection as the drivers so the two layers can't disagree.
 pub fn looks_read_only(sql: &str) -> bool {
-    let head = first_keyword(sql).to_ascii_uppercase();
     matches!(
-        head.as_str(),
+        crate::db::leading_keyword(sql).as_str(),
         "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "DESC"
     )
-}
-
-fn first_keyword(sql: &str) -> String {
-    let mut s = sql.trim_start();
-    // Strip line comments.
-    while s.starts_with("--") {
-        let end = s.find('\n').map(|i| i + 1).unwrap_or(s.len());
-        s = s[end..].trim_start();
-    }
-    // Strip block comments.
-    while s.starts_with("/*") {
-        let Some(end) = s.find("*/") else { return String::new() };
-        s = s[end + 2..].trim_start();
-    }
-    s.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .next()
-        .unwrap_or("")
-        .to_string()
 }
 

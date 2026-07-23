@@ -31,13 +31,10 @@ async fn run_script_on(
     let mut affected = 0u64;
     let mut sets: Vec<ResultSet> = Vec::new();
     for stmt in crate::db::split_statements(sql) {
-        let head = stmt.trim_start().to_ascii_uppercase();
-        let returns_rows = head.starts_with("SELECT")
-            || head.starts_with("WITH")
-            || head.starts_with("SHOW")
-            || head.starts_with("DESCRIBE")
-            || head.starts_with("DESC ")
-            || head.starts_with("EXPLAIN");
+        let returns_rows = matches!(
+            crate::db::leading_keyword(&stmt).as_str(),
+            "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+        );
         if returns_rows {
             let rs = fetch_capped(&mut **conn, &stmt).await?;
             if !rs.columns.is_empty() {
@@ -320,13 +317,10 @@ impl Driver for MySqlDriver {
                 truncated: false,
             });
         }
-        let trimmed = sql.trim_start().to_ascii_uppercase();
-        let is_select = trimmed.starts_with("SELECT")
-            || trimmed.starts_with("WITH")
-            || trimmed.starts_with("SHOW")
-            || trimmed.starts_with("DESCRIBE")
-            || trimmed.starts_with("DESC ")
-            || trimmed.starts_with("EXPLAIN");
+        let is_select = matches!(
+            crate::db::leading_keyword(sql).as_str(),
+            "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+        );
         if is_select {
             let mut rs = fetch_capped(&self.pool, sql).await?;
             if rs.columns.is_empty() {
@@ -367,13 +361,10 @@ impl Driver for MySqlDriver {
                         truncated: false,
                     }])
                 } else {
-                    let head = sql.trim_start().to_ascii_uppercase();
-                    let returns_rows = head.starts_with("SELECT")
-                        || head.starts_with("WITH")
-                        || head.starts_with("SHOW")
-                        || head.starts_with("DESCRIBE")
-                        || head.starts_with("DESC ")
-                        || head.starts_with("EXPLAIN");
+                    let returns_rows = matches!(
+                        crate::db::leading_keyword(sql).as_str(),
+                        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+                    );
                     if returns_rows {
                         Ok(vec![fetch_capped(&mut *conn, sql).await?])
                     } else {
