@@ -4,6 +4,19 @@ A fast, native desktop database client written in Rust ([egui](https://github.co
 
 Supports **PostgreSQL**, **MySQL**, **Microsoft SQL Server**, and **SQLite**.
 
+![Query editor with schema tree and results grid](docs/screenshots/query-editor.png)
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/dbml-diagram.png" alt="DBML diagram editor with table groups and FK curves"></td>
+    <td><img src="docs/screenshots/ai-agent.png" alt="Table data grid with the embedded AI agent panel"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>DBML diagrams — live source pane, draggable tables, colored table groups</em></td>
+    <td align="center"><em>Data grid with filters, plus the embedded Claude agent panel</em></td>
+  </tr>
+</table>
+
 ## Features
 
 - **SQL editor** — completion (schema-aware, fuzzy), multi-statement scripts, query parameters (`:name`), formatting, find/replace, error→cursor jump, saved snippets, persistent query history, per-tab auto-refresh
