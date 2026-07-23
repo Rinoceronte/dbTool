@@ -89,8 +89,11 @@ async fn run_inner(
     // Stash the MCP config in a temp file so claude can load it.
     let config_path = write_mcp_config(&mcp.config_json())?;
 
+    // Windows caps the CreateProcess command line at ~32K chars, which a
+    // schema-bearing system prompt easily exceeds — so the prompt goes in
+    // through stdin and the system prompt through a temp file.
     let mut cmd = Command::new(crate::claude_auth::cli_program());
-    cmd.arg("-p").arg(&inputs.prompt)
+    cmd.arg("-p")
         .arg("--output-format").arg("stream-json")
         .arg("--include-partial-messages")
         .arg("--verbose") // required by stream-json
@@ -100,12 +103,13 @@ async fn run_inner(
         .arg("--permission-mode").arg("bypassPermissions")
         .arg("--model").arg(&inputs.model);
     if !inputs.system.is_empty() {
-        cmd.arg("--append-system-prompt").arg(&inputs.system);
+        let system_path = write_temp_file("dbtool-system", "txt", &inputs.system)?;
+        cmd.arg("--append-system-prompt-file").arg(&system_path);
     }
     if let Some(id) = inputs.resume_id.as_ref() {
         cmd.arg("--resume").arg(id);
     }
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -113,6 +117,15 @@ async fn run_inner(
     let mut child = cmd.spawn().context(
         "failed to spawn `claude` (is it on PATH? A full path can be set in Settings)",
     )?;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().context("no stdin")?;
+        stdin
+            .write_all(inputs.prompt.as_bytes())
+            .await
+            .context("writing prompt to claude stdin")?;
+        // Dropping stdin closes the pipe, signalling the prompt is complete.
+    }
     let stdout = child.stdout.take().context("no stdout")?;
     let stderr = child.stderr.take().context("no stderr")?;
 
@@ -257,11 +270,15 @@ fn handle_sse_event(
 }
 
 fn write_mcp_config(json: &str) -> Result<std::path::PathBuf> {
+    write_temp_file("dbtool-mcp", "json", json)
+}
+
+fn write_temp_file(prefix: &str, ext: &str, contents: &str) -> Result<std::path::PathBuf> {
     use std::io::Write;
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("dbtool-mcp-{}.json", Uuid::new_v4()));
+    let path = dir.join(format!("{prefix}-{}.{ext}", Uuid::new_v4()));
     let mut f = std::fs::File::create(&path)
         .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(json.as_bytes())?;
+    f.write_all(contents.as_bytes())?;
     Ok(path)
 }
