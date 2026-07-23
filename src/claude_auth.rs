@@ -1,4 +1,22 @@
+use std::sync::RwLock;
+
 use serde::Deserialize;
+
+/// Process-wide override for the `claude` binary location, mirroring
+/// `db::set_result_row_cap`: set from Settings at startup and on change.
+static CLI_PATH: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn set_cli_path(path: &str) {
+    let trimmed = path.trim();
+    *CLI_PATH.write().unwrap() =
+        (!trimmed.is_empty()).then(|| trimmed.to_string());
+}
+
+/// The program to spawn for the Claude CLI: the configured path, or plain
+/// `claude` resolved from PATH when unset.
+pub fn cli_program() -> String {
+    CLI_PATH.read().unwrap().clone().unwrap_or_else(|| "claude".to_string())
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AuthStatus {
@@ -19,13 +37,18 @@ pub struct AuthStatus {
 /// Run `claude auth status --json` and parse the result.
 pub async fn probe_status() -> anyhow::Result<AuthStatus> {
     use tokio::process::Command;
-    let output = Command::new("claude")
+    let program = cli_program();
+    let output = Command::new(&program)
         .arg("auth")
         .arg("status")
         .arg("--json")
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn `claude` (is it on PATH?): {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to spawn `{program}` (is it on PATH? A full path can be set in Settings): {e}"
+            )
+        })?;
     // Exit code is non-zero when logged out on some builds; trust stdout regardless.
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.trim().is_empty() {
@@ -47,7 +70,7 @@ pub struct LoginOutcome {
 pub async fn run_login(use_console: bool) -> anyhow::Result<LoginOutcome> {
     use std::process::Stdio;
     use tokio::process::Command;
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(cli_program());
     cmd.arg("auth").arg("login");
     if use_console {
         cmd.arg("--console");
@@ -80,7 +103,7 @@ pub async fn run_login(use_console: bool) -> anyhow::Result<LoginOutcome> {
 pub async fn run_logout() -> anyhow::Result<String> {
     use std::process::Stdio;
     use tokio::process::Command;
-    let output = Command::new("claude")
+    let output = Command::new(cli_program())
         .arg("auth")
         .arg("logout")
         .stdin(Stdio::null())

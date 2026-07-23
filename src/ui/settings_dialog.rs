@@ -71,6 +71,21 @@ pub fn draw(
             ui.separator();
             ui.label(egui::RichText::new("Claude account").strong());
             ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label("CLI path:");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut settings.claude_cli_path)
+                            .hint_text("claude (from PATH)")
+                            .desired_width(280.0),
+                    )
+                    .on_hover_text(
+                        "Full path to the `claude` executable. \
+                         Leave empty to use `claude` from PATH.",
+                    )
+                    .changed();
+            });
+            ui.add_space(4.0);
             auth_action = auth_dialog::draw_body(ui, auth);
         });
     *open = still_open;

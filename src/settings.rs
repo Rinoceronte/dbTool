@@ -16,6 +16,8 @@ pub struct Settings {
     /// Editor results stop materializing rows past this cap (min 50); the
     /// grid offers "Fetch all rows" to lift it per query.
     pub max_result_rows: usize,
+    /// Full path to the `claude` CLI executable; empty = find `claude` on PATH.
+    pub claude_cli_path: String,
 }
 
 impl Default for Settings {
@@ -25,6 +27,7 @@ impl Default for Settings {
             sql_line_numbers: true,
             dbml_line_numbers: true,
             max_result_rows: 5000,
+            claude_cli_path: String::new(),
         }
     }
 }

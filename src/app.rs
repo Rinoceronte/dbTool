@@ -216,6 +216,7 @@ impl App {
         let profiles = connections::load_profiles().unwrap_or_default();
         let settings = crate::settings::load();
         crate::db::set_result_row_cap(settings.max_result_rows);
+        crate::claude_auth::set_cli_path(&settings.claude_cli_path);
         theme::install_fonts(&cc.egui_ctx);
         theme::install(&cc.egui_ctx, settings.theme);
         let mut app = Self {
@@ -3572,6 +3573,7 @@ impl eframe::App for App {
         if settings_changed {
             theme::install(ctx, self.settings.theme);
             crate::db::set_result_row_cap(self.settings.max_result_rows);
+            crate::claude_auth::set_cli_path(&self.settings.claude_cli_path);
             if let Err(e) = crate::settings::save(&self.settings) {
                 self.status = Some(format!("Could not save settings: {e}"));
             }

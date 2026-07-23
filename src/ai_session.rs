@@ -89,7 +89,7 @@ async fn run_inner(
     // Stash the MCP config in a temp file so claude can load it.
     let config_path = write_mcp_config(&mcp.config_json())?;
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(crate::claude_auth::cli_program());
     cmd.arg("-p").arg(&inputs.prompt)
         .arg("--output-format").arg("stream-json")
         .arg("--include-partial-messages")
@@ -110,7 +110,9 @@ async fn run_inner(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = cmd.spawn().context("failed to spawn `claude` (is it on PATH?)")?;
+    let mut child = cmd.spawn().context(
+        "failed to spawn `claude` (is it on PATH? A full path can be set in Settings)",
+    )?;
     let stdout = child.stdout.take().context("no stdout")?;
     let stderr = child.stderr.take().context("no stderr")?;
 
