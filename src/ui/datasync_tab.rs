@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::db::datasync::{MaskMap, MaskStrategy, TableReport, TableSel, suggest_mask};
+use crate::db::datasync::{
+    FakeKind, MaskMap, MaskStrategy, TableReport, TableSel, infer_fake, suggest_mask,
+};
 use crate::db::{DbKind, DbMeta};
 use crate::runtime::ConnectionId;
 
@@ -235,10 +237,26 @@ pub fn draw(
                 tab.pull_armed = true;
             }
         } else {
-            ui.label(
-                egui::RichText::new("Replaces the target tables' data. Sure?")
-                    .color(ui.visuals().error_fg_color),
-            );
+            let conn_label = |id: Option<crate::runtime::ConnectionId>| {
+                id.and_then(|c| active.iter().find(|a| a.conn_id == c))
+                    .map(|a| format!("{} · {}", a.name, a.database))
+                    .unwrap_or_else(|| "?".into())
+            };
+            // Wrap the warning at a width that always leaves the yes/no
+            // buttons visible on the row.
+            let text = egui::RichText::new(format!(
+                "Deletes ALL rows of {} table(s) on {} and refills them \
+                 from {}. Sure?",
+                tab.selected.len(),
+                conn_label(tab.target),
+                conn_label(tab.source),
+            ))
+            .color(ui.visuals().error_fg_color);
+            ui.scope(|ui| {
+                let reserve = 170.0; // "Yes, pull" + "Cancel"
+                ui.set_max_width((ui.available_width() - reserve).max(220.0));
+                ui.add(egui::Label::new(text).wrap());
+            });
             if ui
                 .add(
                     egui::Button::new(egui::RichText::new("Yes, pull").color(egui::Color32::WHITE))
@@ -311,7 +329,14 @@ pub fn draw(
         {
             for t in &meta.tables {
                 for c in &t.columns {
-                    if let Some(s) = suggest_mask(&c.name) {
+                    // JSON columns get the scrub (it only touches
+                    // sensitive-looking keys, so it's always safe).
+                    let s = if c.type_name.to_ascii_lowercase().contains("json") {
+                        Some(MaskStrategy::JsonScrub)
+                    } else {
+                        suggest_mask(&c.name)
+                    };
+                    if let Some(s) = s {
                         tab.masks
                             .entry(format!("{}.{}.{}", t.schema, t.name, c.name))
                             .or_insert(s);
@@ -395,11 +420,16 @@ pub fn draw(
                         for c in &t.columns {
                             let col_key = format!("{key}.{}", c.name);
                             ui.horizontal(|ui| {
-                                ui.label(
+                                let name_label = ui.label(
                                     egui::RichText::new(format!("{} · {}", c.name, c.type_name))
                                         .monospace()
                                         .small(),
                                 );
+                                if !c.nullable {
+                                    name_label.on_hover_text(
+                                        "NOT NULL — the NULL mask is not offered",
+                                    );
+                                }
                                 let current = tab.masks.get(&col_key).cloned();
                                 let label = current
                                     .as_ref()
@@ -412,14 +442,64 @@ pub fn draw(
                                         if ui.selectable_label(current.is_none(), "keep").clicked() {
                                             tab.masks.remove(&col_key);
                                         }
-                                        for opt in [
-                                            MaskStrategy::Null,
-                                            MaskStrategy::Hash,
-                                            MaskStrategy::HashEmail,
-                                        ] {
+                                        let opts = if c.nullable {
+                                            &[
+                                                MaskStrategy::Null,
+                                                MaskStrategy::Empty,
+                                                MaskStrategy::Hash,
+                                            ][..]
+                                        } else {
+                                            // NULL would violate the column's
+                                            // NOT NULL constraint mid-pull.
+                                            &[MaskStrategy::Empty, MaskStrategy::Hash][..]
+                                        };
+                                        for opt in opts.iter().cloned() {
                                             let sel = current.as_ref() == Some(&opt);
                                             if ui.selectable_label(sel, opt.label()).clicked() {
                                                 tab.masks.insert(col_key.clone(), opt.clone());
+                                            }
+                                        }
+                                        // One "fake" entry; the kind comes from
+                                        // the column's name and type.
+                                        match infer_fake(&c.name, &c.type_name) {
+                                            Some(f) => {
+                                                let sel = current.as_ref() == Some(&f);
+                                                if ui
+                                                    .selectable_label(sel, f.label())
+                                                    .on_hover_text(
+                                                        "Deterministic realistic fake — the \
+                                                         kind is inferred from the column",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    tab.masks.insert(col_key.clone(), f.clone());
+                                                }
+                                            }
+                                            // Nothing inferable: offer every
+                                            // fake kind so it stays possible.
+                                            None => {
+                                                ui.separator();
+                                                for kind in FakeKind::ALL {
+                                                    let opt = MaskStrategy::Fake(kind);
+                                                    let sel = current.as_ref() == Some(&opt);
+                                                    if ui
+                                                        .selectable_label(sel, kind.label())
+                                                        .clicked()
+                                                    {
+                                                        tab.masks.insert(col_key.clone(), opt);
+                                                    }
+                                                }
+                                                let scrub =
+                                                    current == Some(MaskStrategy::JsonScrub);
+                                                if ui
+                                                    .selectable_label(scrub, "scrub JSON")
+                                                    .clicked()
+                                                {
+                                                    tab.masks.insert(
+                                                        col_key.clone(),
+                                                        MaskStrategy::JsonScrub,
+                                                    );
+                                                }
                                             }
                                         }
                                         let is_fixed =

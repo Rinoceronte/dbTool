@@ -36,22 +36,206 @@ impl TableSel {
 pub enum MaskStrategy {
     /// Replace with NULL.
     Null,
+    /// Replace with the empty string (satisfies NOT NULL, unlike Null).
+    Empty,
     /// Replace with a fixed value (typed like a parameter: NULL/number/text).
     Fixed(String),
     /// Deterministic hash of the original (preserves joins & uniqueness).
     Hash,
     /// Deterministic fake email derived from the original.
     HashEmail,
+    /// Realistic fake data, deterministically derived from the original
+    /// (same source value → same fake, so joins and re-pulls stay stable).
+    Fake(FakeKind),
+    /// Parse the value as JSON and recursively replace leaves under
+    /// sensitive-looking keys (per `suggest_mask`) with deterministic fakes,
+    /// keeping the structure and everything else intact.
+    JsonScrub,
+}
+
+/// What kind of realistic fake to generate for a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FakeKind {
+    Name,
+    FirstName,
+    LastName,
+    Email,
+    Phone,
+    Street,
+    City,
+    Company,
+    Ssn,
+    BirthDate,
+    Zip,
+    Age,
+    Int,
+    Price,
+}
+
+impl FakeKind {
+    pub const ALL: [FakeKind; 14] = [
+        FakeKind::Name,
+        FakeKind::FirstName,
+        FakeKind::LastName,
+        FakeKind::Email,
+        FakeKind::Phone,
+        FakeKind::Street,
+        FakeKind::City,
+        FakeKind::Company,
+        FakeKind::Ssn,
+        FakeKind::BirthDate,
+        FakeKind::Zip,
+        FakeKind::Age,
+        FakeKind::Int,
+        FakeKind::Price,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            FakeKind::Name => "fake name",
+            FakeKind::FirstName => "fake first name",
+            FakeKind::LastName => "fake last name",
+            FakeKind::Email => "fake email",
+            FakeKind::Phone => "fake phone",
+            FakeKind::Street => "fake street",
+            FakeKind::City => "fake city",
+            FakeKind::Company => "fake company",
+            FakeKind::Ssn => "fake SSN",
+            FakeKind::BirthDate => "fake birth date",
+            FakeKind::Zip => "fake zip",
+            FakeKind::Age => "fake age",
+            FakeKind::Int => "fake number",
+            FakeKind::Price => "fake price",
+        }
+    }
 }
 
 impl MaskStrategy {
     pub fn label(&self) -> &'static str {
         match self {
             MaskStrategy::Null => "NULL",
+            MaskStrategy::Empty => "empty",
             MaskStrategy::Fixed(_) => "fixed",
             MaskStrategy::Hash => "hash",
-            MaskStrategy::HashEmail => "email",
+            MaskStrategy::HashEmail => "hash email",
+            MaskStrategy::Fake(k) => k.label(),
+            MaskStrategy::JsonScrub => "scrub JSON",
         }
+    }
+}
+
+/// Deterministic fake: the original value's hash seeds the RNG, so identical
+/// inputs always map to the identical fake across tables and pulls. Numeric
+/// kinds return typed values so they insert into numeric columns unquoted.
+fn fake_value(kind: FakeKind, original: &str) -> Value {
+    use fake::Fake;
+    use fake::faker::address::en::{BuildingNumber, CityName, StreetName};
+    use fake::faker::company::en::CompanyName;
+    use fake::faker::name::en::{FirstName, LastName, Name};
+    use rand::SeedableRng;
+
+    let seed = fnv64(original);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    // Count of leading integer digits — keeps fake numbers in the same
+    // order of magnitude as the original so distributions stay plausible.
+    let int_digits = |cap: u32| -> u32 {
+        (original
+            .trim()
+            .trim_start_matches('-')
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count() as u32)
+            .clamp(1, cap)
+    };
+    let text = |s: String| Value::Text(s);
+    match kind {
+        FakeKind::Name => text(Name().fake_with_rng(&mut rng)),
+        FakeKind::FirstName => text(FirstName().fake_with_rng(&mut rng)),
+        FakeKind::LastName => text(LastName().fake_with_rng(&mut rng)),
+        // Wordlists are small; a short hash suffix keeps UNIQUE columns safe.
+        FakeKind::Email => {
+            let first: String = FirstName().fake_with_rng(&mut rng);
+            let last: String = LastName().fake_with_rng(&mut rng);
+            text(format!(
+                "{}.{}.{:06x}@example.test",
+                first.to_lowercase(),
+                last.to_lowercase(),
+                seed & 0xff_ffff
+            ))
+        }
+        FakeKind::Phone => {
+            text(format!("({:03}) 555-{:04}", 200 + seed % 800, (seed >> 16) % 10000))
+        }
+        FakeKind::Street => {
+            let number: String = BuildingNumber().fake_with_rng(&mut rng);
+            let street: String = StreetName().fake_with_rng(&mut rng);
+            text(format!("{number} {street}"))
+        }
+        FakeKind::City => text(CityName().fake_with_rng(&mut rng)),
+        FakeKind::Company => text(CompanyName().fake_with_rng(&mut rng)),
+        // 9xx area numbers are never issued, so these can't hit a real SSN.
+        FakeKind::Ssn => text(format!(
+            "9{:02}-{:02}-{:04}",
+            (seed >> 4) % 100,
+            (seed >> 12) % 100,
+            (seed >> 20) % 10000
+        )),
+        // ISO date so it inserts cleanly into DATE-typed columns.
+        FakeKind::BirthDate => text(format!(
+            "{}-{:02}-{:02}",
+            1950 + seed % 50,
+            1 + (seed >> 8) % 12,
+            1 + (seed >> 16) % 28
+        )),
+        FakeKind::Zip => text(format!("{:05}", seed % 100_000)),
+        FakeKind::Age => Value::Int((18 + seed % 73) as i64),
+        FakeKind::Int => {
+            let digits = int_digits(12);
+            let lo = 10i64.pow(digits - 1);
+            let hi = 10i64.pow(digits);
+            let sign = if original.trim_start().starts_with('-') { -1 } else { 1 };
+            Value::Int(sign * (lo + (seed % (hi - lo) as u64) as i64))
+        }
+        FakeKind::Price => {
+            let digits = int_digits(9);
+            let lo = 10u64.pow(digits - 1);
+            let hi = 10u64.pow(digits);
+            let whole = lo + seed % (hi - lo);
+            let cents = (seed >> 24) % 100;
+            Value::Float((whole * 100 + cents) as f64 / 100.0)
+        }
+    }
+}
+
+/// Recursively mask a JSON tree in place: leaves under sensitive-looking
+/// keys get the matching deterministic fake; JSON nulls and everything
+/// under unsuspicious keys stay as-is.
+fn scrub_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if val.is_null() {
+                    continue;
+                }
+                match suggest_mask(key) {
+                    Some(strategy) => {
+                        let original = match &*val {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        let masked = mask_value(&strategy, &Value::Text(original));
+                        *val = match masked {
+                            Value::Int(i) => serde_json::Value::from(i),
+                            Value::Float(f) => serde_json::json!(f),
+                            other => serde_json::Value::String(other.display()),
+                        };
+                    }
+                    None => scrub_json(val),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
+        _ => {}
     }
 }
 
@@ -140,10 +324,27 @@ pub fn mask_value(strategy: &MaskStrategy, v: &Value) -> Value {
     }
     match strategy {
         MaskStrategy::Null => Value::Null,
+        MaskStrategy::Empty => Value::Text(String::new()),
         MaskStrategy::Fixed(text) => typed_fixed(text),
         MaskStrategy::Hash => Value::Text(format!("{:016x}", fnv64(&v.display()))),
         MaskStrategy::HashEmail => {
             Value::Text(format!("user_{:012x}@example.test", fnv64(&v.display()) & 0xffff_ffff_ffff))
+        }
+        MaskStrategy::Fake(kind) => fake_value(*kind, &v.display()),
+        MaskStrategy::JsonScrub => {
+            let parsed = match v {
+                Value::Json(j) => Some(j.clone()),
+                Value::Text(s) => serde_json::from_str(s).ok(),
+                _ => None,
+            };
+            match parsed {
+                Some(mut j) => {
+                    scrub_json(&mut j);
+                    Value::Json(j)
+                }
+                // Not valid JSON: never pass the original through unmasked.
+                None => Value::Json(serde_json::Value::String("<masked>".into())),
+            }
         }
     }
 }
@@ -160,20 +361,88 @@ pub fn mask_row(sel: &TableSel, masks: &MaskMap, row: &mut [Value]) {
 }
 
 /// Column names that likely hold personal data → suggested strategy.
+/// Recognizable shapes (names, emails, phones, addresses) get realistic
+/// fakes; secrets and identifiers fall back to the opaque hash.
 pub fn suggest_mask(column: &str) -> Option<MaskStrategy> {
-    let c = column.to_ascii_lowercase();
+    // Squash separators so snake_case, camelCase and kebab-case all match
+    // the same keywords ("first_name", "firstName", "first-name" → "firstname").
+    let c: String = column
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect();
     if c.contains("email") {
-        return Some(MaskStrategy::HashEmail);
+        return Some(MaskStrategy::Fake(FakeKind::Email));
+    }
+    const FAKED: &[(&str, FakeKind)] = &[
+        ("firstname", FakeKind::FirstName),
+        ("lastname", FakeKind::LastName),
+        ("surname", FakeKind::LastName),
+        ("fullname", FakeKind::Name),
+        ("phone", FakeKind::Phone),
+        ("mobile", FakeKind::Phone),
+        ("address", FakeKind::Street),
+        ("street", FakeKind::Street),
+        ("city", FakeKind::City),
+        ("company", FakeKind::Company),
+        ("employer", FakeKind::Company),
+        ("ssn", FakeKind::Ssn),
+        ("socialsecurity", FakeKind::Ssn),
+        ("birthdate", FakeKind::BirthDate),
+        ("dob", FakeKind::BirthDate),
+        ("zip", FakeKind::Zip),
+        ("postal", FakeKind::Zip),
+        ("price", FakeKind::Price),
+        ("cost", FakeKind::Price),
+        ("amount", FakeKind::Price),
+        ("salary", FakeKind::Price),
+        ("balance", FakeKind::Price),
+        ("quantity", FakeKind::Int),
+        ("qty", FakeKind::Int),
+    ];
+    if let Some((_, kind)) = FAKED.iter().find(|(k, _)| c.contains(k)) {
+        return Some(MaskStrategy::Fake(*kind));
+    }
+    // Exact match only: "age" as a substring is far too common (page, usage…).
+    if c == "age" {
+        return Some(MaskStrategy::Fake(FakeKind::Age));
     }
     const HASHED: &[&str] = &[
-        "password", "passwd", "secret", "token", "api_key", "apikey", "ssn",
-        "social_security", "credit_card", "card_number", "iban", "phone",
-        "mobile", "first_name", "last_name", "full_name", "surname",
-        "birthdate", "birth_date", "dob", "address", "street", "zip",
-        "postal", "salary", "iban", "license",
+        "password", "passwd", "secret", "token", "apikey",
+        "creditcard", "cardnumber", "iban", "license",
     ];
     if HASHED.iter().any(|k| c.contains(k)) {
         return Some(MaskStrategy::Hash);
+    }
+    None
+}
+
+/// Best fake strategy for a column, inferred from its type and name. The UI
+/// offers one "fake" option backed by this; None disables it. Broader than
+/// `suggest_mask` (bare "name" columns count here but are too ambiguous to
+/// auto-suggest).
+pub fn infer_fake(column: &str, type_name: &str) -> Option<MaskStrategy> {
+    let ty = type_name.to_ascii_lowercase();
+    if ty.contains("json") {
+        return Some(MaskStrategy::JsonScrub);
+    }
+    if let Some(s @ MaskStrategy::Fake(_)) = suggest_mask(column) {
+        return Some(s);
+    }
+    let c = column.to_ascii_lowercase();
+    if c == "name" || c.ends_with("_name") || column.ends_with("Name") {
+        return Some(MaskStrategy::Fake(FakeKind::Name));
+    }
+    // Type-based fallback for numeric columns the name says nothing about.
+    let inty = ty.contains("int") && !ty.contains("interval") && !ty.contains("point");
+    if inty || ty.contains("serial") {
+        return Some(MaskStrategy::Fake(FakeKind::Int));
+    }
+    if ["numeric", "decimal", "double", "float", "real", "money"]
+        .iter()
+        .any(|k| ty.contains(k))
+    {
+        return Some(MaskStrategy::Fake(FakeKind::Price));
     }
     None
 }
@@ -755,6 +1024,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fake_masks_are_deterministic_and_shaped() {
+        let v = Value::Text("John Smith".into());
+        for kind in FakeKind::ALL {
+            let a = mask_value(&MaskStrategy::Fake(kind), &v);
+            let b = mask_value(&MaskStrategy::Fake(kind), &v);
+            assert_eq!(a.display(), b.display(), "{kind:?} not deterministic");
+            assert_ne!(a.display(), "John Smith", "{kind:?} left value unmasked");
+            assert!(!a.display().is_empty());
+            // NULL passes through untouched.
+            assert!(matches!(mask_value(&MaskStrategy::Fake(kind), &Value::Null), Value::Null));
+        }
+        // Different inputs diverge (same seed would defeat the purpose).
+        let other = Value::Text("Jane Doe".into());
+        assert_ne!(
+            mask_value(&MaskStrategy::Fake(FakeKind::Name), &v).display(),
+            mask_value(&MaskStrategy::Fake(FakeKind::Name), &other).display()
+        );
+        let email = mask_value(&MaskStrategy::Fake(FakeKind::Email), &v).display();
+        assert!(email.ends_with("@example.test"), "got {email}");
+        assert!(!email.contains(' '), "got {email}");
+        // Numeric fakes are typed and magnitude-preserving.
+        let age = mask_value(&MaskStrategy::Fake(FakeKind::Age), &Value::Int(37));
+        assert!(matches!(age, Value::Int(n) if (18..=90).contains(&n)));
+        let qty = mask_value(&MaskStrategy::Fake(FakeKind::Int), &Value::Int(742));
+        assert!(matches!(qty, Value::Int(n) if (100..1000).contains(&n)), "got {qty:?}");
+        let neg = mask_value(&MaskStrategy::Fake(FakeKind::Int), &Value::Int(-5));
+        assert!(matches!(neg, Value::Int(n) if (-9..0).contains(&n)), "got {neg:?}");
+        let price = mask_value(&MaskStrategy::Fake(FakeKind::Price), &Value::Float(19.99));
+        assert!(matches!(price, Value::Float(f) if (10.0..100.0).contains(&f)), "got {price:?}");
+    }
+
+    #[test]
     fn masking_is_deterministic_and_null_safe() {
         let email = Value::Text("thomas@example.com".into());
         let a = mask_value(&MaskStrategy::HashEmail, &email);
@@ -769,11 +1070,67 @@ mod tests {
 
     #[test]
     fn suggestions_catch_the_usual_suspects() {
-        assert_eq!(suggest_mask("primary_email"), Some(MaskStrategy::HashEmail));
+        assert_eq!(suggest_mask("primary_email"), Some(MaskStrategy::Fake(FakeKind::Email)));
         assert!(matches!(suggest_mask("password_hash"), Some(MaskStrategy::Hash)));
-        assert!(matches!(suggest_mask("phone_number"), Some(MaskStrategy::Hash)));
+        assert_eq!(suggest_mask("phone_number"), Some(MaskStrategy::Fake(FakeKind::Phone)));
+        assert_eq!(suggest_mask("ssn"), Some(MaskStrategy::Fake(FakeKind::Ssn)));
+        assert_eq!(suggest_mask("date_of_birth"), None); // only birthdate/dob spellings
+        assert_eq!(suggest_mask("dob"), Some(MaskStrategy::Fake(FakeKind::BirthDate)));
         assert_eq!(suggest_mask("created_at"), None);
         assert_eq!(suggest_mask("id"), None);
+    }
+
+    #[test]
+    fn fake_kind_inference() {
+        assert_eq!(infer_fake("shipping_address", "jsonb"), Some(MaskStrategy::JsonScrub));
+        assert_eq!(infer_fake("email", "varchar"), Some(MaskStrategy::Fake(FakeKind::Email)));
+        assert_eq!(infer_fake("first_name", "text"), Some(MaskStrategy::Fake(FakeKind::FirstName)));
+        // Bare name columns fake as a person name (manual option only).
+        assert_eq!(infer_fake("name", "text"), Some(MaskStrategy::Fake(FakeKind::Name)));
+        assert_eq!(infer_fake("display_name", "text"), Some(MaskStrategy::Fake(FakeKind::Name)));
+        assert_eq!(infer_fake("total", "numeric"), Some(MaskStrategy::Fake(FakeKind::Price)));
+        assert_eq!(infer_fake("visits", "integer"), Some(MaskStrategy::Fake(FakeKind::Int)));
+        assert_eq!(infer_fake("age", "integer"), Some(MaskStrategy::Fake(FakeKind::Age)));
+        assert_eq!(infer_fake("notes", "text"), None);
+        assert_eq!(infer_fake("password", "text"), None); // hash, not fake
+        // camelCase / kebab-case columns match the same keywords.
+        assert_eq!(suggest_mask("firstName"), Some(MaskStrategy::Fake(FakeKind::FirstName)));
+        assert_eq!(suggest_mask("socialSecurity"), Some(MaskStrategy::Fake(FakeKind::Ssn)));
+        assert_eq!(suggest_mask("credit-card"), Some(MaskStrategy::Hash));
+        assert_eq!(infer_fake("displayName", "text"), Some(MaskStrategy::Fake(FakeKind::Name)));
+        // Empty is a real value, not NULL.
+        assert!(matches!(
+            mask_value(&MaskStrategy::Empty, &Value::Text("x".into())),
+            Value::Text(s) if s.is_empty()
+        ));
+    }
+
+    #[test]
+    fn json_scrub_masks_sensitive_keys_only() {
+        let v = Value::Json(serde_json::json!({
+            "street": "1 Real Street",
+            "city": "Realville",
+            "note": "keep me",
+            "nested": { "phone": "555-REAL", "count": 3 },
+            "email": null
+        }));
+        let Value::Json(out) = mask_value(&MaskStrategy::JsonScrub, &v) else {
+            panic!("expected JSON out");
+        };
+        assert_ne!(out["street"], "1 Real Street");
+        assert_ne!(out["city"], "Realville");
+        assert_eq!(out["note"], "keep me");
+        assert_ne!(out["nested"]["phone"], "555-REAL");
+        assert_eq!(out["nested"]["count"], 3);
+        assert!(out["email"].is_null(), "JSON nulls stay null");
+        // Deterministic and structure-preserving.
+        let Value::Json(again) = mask_value(&MaskStrategy::JsonScrub, &v) else {
+            panic!("expected JSON out");
+        };
+        assert_eq!(out, again);
+        // Garbage never passes through unmasked.
+        let junk = mask_value(&MaskStrategy::JsonScrub, &Value::Text("not json".into()));
+        assert_eq!(junk.display(), "\"<masked>\"");
     }
 
     #[test]

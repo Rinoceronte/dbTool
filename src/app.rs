@@ -2926,6 +2926,33 @@ impl App {
         if tables.is_empty() {
             return;
         }
+        // Preflight the masks: NULL into a NOT NULL column only fails
+        // server-side, after the target table was already emptied.
+        if let Some(meta) = &t.meta {
+            for tm in &meta.tables {
+                let tkey = format!("{}.{}", tm.schema, tm.name);
+                if !t.selected.contains(&tkey) {
+                    continue;
+                }
+                for c in tm.columns.iter().filter(|c| !c.nullable) {
+                    use crate::db::datasync::MaskStrategy;
+                    let makes_null = match masks.get(&format!("{tkey}.{}", c.name)) {
+                        Some(MaskStrategy::Null) => true,
+                        Some(MaskStrategy::Fixed(v)) => v.trim().eq_ignore_ascii_case("null"),
+                        _ => false,
+                    };
+                    if makes_null {
+                        t.error = Some(format!(
+                            "{tkey}.{} is NOT NULL but its mask produces NULL — \
+                             the pull would fail after emptying the table. Fix the \
+                             mask first; nothing was run.",
+                            c.name
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
         // Hard rails: never write into read-only or production-flagged targets.
         let target_profile = self.find_active_by_conn(target).map(|a| a.profile_id);
         let blocked = target_profile.is_some_and(|pid| {
