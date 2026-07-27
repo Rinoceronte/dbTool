@@ -18,6 +18,17 @@ pub fn cli_program() -> String {
     CLI_PATH.read().unwrap().clone().unwrap_or_else(|| "claude".to_string())
 }
 
+/// A `Command` for the Claude CLI with platform quirks applied. On Windows,
+/// spawning the console-subsystem CLI from a GUI app pops up a terminal
+/// window unless CREATE_NO_WINDOW is set.
+pub fn cli_command() -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = tokio::process::Command::new(cli_program());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AuthStatus {
     #[serde(rename = "loggedIn", default)]
@@ -36,9 +47,8 @@ pub struct AuthStatus {
 
 /// Run `claude auth status --json` and parse the result.
 pub async fn probe_status() -> anyhow::Result<AuthStatus> {
-    use tokio::process::Command;
     let program = cli_program();
-    let output = Command::new(&program)
+    let output = cli_command()
         .arg("auth")
         .arg("status")
         .arg("--json")
@@ -69,8 +79,7 @@ pub struct LoginOutcome {
 /// or `--claudeai` (default, claude.ai subscription).
 pub async fn run_login(use_console: bool) -> anyhow::Result<LoginOutcome> {
     use std::process::Stdio;
-    use tokio::process::Command;
-    let mut cmd = Command::new(cli_program());
+    let mut cmd = cli_command();
     cmd.arg("auth").arg("login");
     if use_console {
         cmd.arg("--console");
@@ -102,8 +111,7 @@ pub async fn run_login(use_console: bool) -> anyhow::Result<LoginOutcome> {
 
 pub async fn run_logout() -> anyhow::Result<String> {
     use std::process::Stdio;
-    use tokio::process::Command;
-    let output = Command::new(cli_program())
+    let output = cli_command()
         .arg("auth")
         .arg("logout")
         .stdin(Stdio::null())
