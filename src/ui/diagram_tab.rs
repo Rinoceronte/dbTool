@@ -43,9 +43,7 @@ impl Default for DiagramLayout {
 
 impl DiagramLayout {
     pub fn sidecar_path(dbml_path: &Path) -> PathBuf {
-        let mut s = dbml_path.as_os_str().to_owned();
-        s.push(".layout.json");
-        PathBuf::from(s)
+        crate::dbml::sidecar_layout_path(dbml_path)
     }
 
     pub fn load(dbml_path: &Path) -> Option<Self> {
@@ -84,9 +82,18 @@ pub struct DiagramTab {
     pub node_sizes: Vec<egui::Vec2>,
     pub sizes_stale: bool,
     pub drag: Option<DragKind>,
+    /// Raw (un-snapped) drag state: start position and effective size of each
+    /// dragged table, plus accumulated pointer travel since drag start. Node
+    /// positions are recomputed from these every frame so snap corrections
+    /// never drift.
+    pub drag_origin: Vec<(String, egui::Pos2, egui::Vec2)>,
+    pub drag_accum: egui::Vec2,
     pub selected: Option<usize>,
     pub want_fit: bool,
     pub want_reset_zoom: bool,
+    /// Center the view on this table (bare or schema-qualified name) once the
+    /// model is available; set by the AI's `focus_table` tool.
+    pub want_focus: Option<String>,
     /// Status text produced inside the canvas (e.g. sidecar write errors),
     /// drained by draw() into a DiagramAction.
     pub pending_status: Option<String>,
@@ -116,9 +123,12 @@ impl DiagramTab {
             node_sizes: Vec::new(),
             sizes_stale: true,
             drag: None,
+            drag_origin: Vec::new(),
+            drag_accum: egui::Vec2::ZERO,
             selected: None,
             want_fit,
             want_reset_zoom: false,
+            want_focus: None,
             pending_status: None,
         }
     }

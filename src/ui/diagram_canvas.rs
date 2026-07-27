@@ -17,6 +17,9 @@ const GROUP_PAD: f32 = 24.0;
 const GROUP_LABEL_H: f32 = 20.0;
 const ZOOM_MIN: f32 = 0.02;
 const ZOOM_MAX: f32 = 3.0;
+/// Snap-to-align distance in screen pixels while dragging; hold Alt to
+/// drag freely.
+const SNAP_DIST: f32 = 8.0;
 /// Seconds of pan/zoom quiet before the layout sidecar is flushed.
 const LAYOUT_FLUSH_AFTER: f64 = 0.7;
 
@@ -65,6 +68,32 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
         let pan = center - world_center;
         tab.layout.pan = (pan.x, pan.y);
         tab.mark_layout_dirty(now);
+    }
+    if let Some(query) = tab.want_focus.take() {
+        let want = query.to_lowercase();
+        let idx = model.tables.iter().position(|t| {
+            t.key.to_lowercase() == want
+                || t.name.to_lowercase() == want
+                || crate::dbml::bare_table_name(&t.key).to_lowercase() == want
+        });
+        if let Some(i) = idx {
+            tab.selected = Some(i);
+            let pos = tab
+                .layout
+                .tables
+                .get(&model.tables[i].key)
+                .map(|p| pos2(p.x, p.y))
+                .unwrap_or(pos2(40.0, 40.0));
+            let size = tab.node_sizes.get(i).copied().unwrap_or(vec2(MIN_W, HEADER_H));
+            // Keep the user's zoom unless they're zoomed too far out to read
+            // the table they asked to see.
+            let zoom = tab.layout.zoom.max(0.6);
+            tab.layout.zoom = zoom;
+            let world_center = pos + size * 0.5;
+            let pan = canvas_rect.center() - canvas_rect.min - world_center.to_vec2() * zoom;
+            tab.layout.pan = (pan.x, pan.y);
+            tab.mark_layout_dirty(now);
+        }
     }
 
     let zoom = tab.layout.zoom;
@@ -136,6 +165,7 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
         );
         if resp.drag_started() {
             tab.drag = Some(DragKind::Group(gi));
+            begin_drag(tab, &model, &model.groups[gi].tables);
         }
         if resp.dragged() && tab.drag == Some(DragKind::Group(gi)) {
             moved = Some((DragKind::Group(gi), resp.drag_delta() / zoom));
@@ -153,6 +183,7 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
         );
         if resp.drag_started() {
             tab.drag = Some(DragKind::Node(ti));
+            begin_drag(tab, &model, &[ti]);
         }
         if resp.dragged() && tab.drag == Some(DragKind::Node(ti)) {
             moved = Some((DragKind::Node(ti), resp.drag_delta() / zoom));
@@ -172,17 +203,83 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
         }
     }
 
-    if let Some((kind, delta)) = moved {
-        let indices: Vec<usize> = match kind {
-            DragKind::Node(ti) => vec![ti],
-            DragKind::Group(gi) => model.groups[gi].tables.clone(),
-            DragKind::Pan => vec![],
-        };
-        for ti in indices {
-            let key = model.tables[ti].key.clone();
-            let entry = ensure_pos(tab, &key);
-            entry.x += delta.x;
-            entry.y += delta.y;
+    let mut snap_guides: Vec<(Pos2, Pos2)> = Vec::new();
+    if let Some((_, delta)) = moved {
+        tab.drag_accum += delta;
+        let accum = tab.drag_accum;
+        let origin = tab.drag_origin.clone();
+
+        // Raw (un-snapped) world bounds of the dragged set.
+        let mut raw: Option<Rect> = None;
+        for (_, start, size) in &origin {
+            let r = Rect::from_min_size(*start + accum, *size);
+            raw = Some(match raw {
+                None => r,
+                Some(b) => b.union(r),
+            });
+        }
+
+        // Snap the raw bounds to edges/centers of on-screen tables.
+        let mut snap = Vec2::ZERO;
+        if let (Some(bounds), false) = (raw, ui.input(|i| i.modifiers.alt)) {
+            let dragged: std::collections::HashSet<&str> =
+                origin.iter().map(|(k, _, _)| k.as_str()).collect();
+            let thresh = SNAP_DIST / zoom;
+            let edges = |lo: f32, hi: f32| [lo, (lo + hi) * 0.5, hi];
+            // (|correction|, correction, aligned coord, target rect)
+            let mut best_x: Option<(f32, f32, f32, Rect)> = None;
+            let mut best_y: Option<(f32, f32, f32, Rect)> = None;
+            for (i, t) in model.tables.iter().enumerate() {
+                if dragged.contains(t.key.as_str()) || !canvas_rect.intersects(node_rects[i]) {
+                    continue;
+                }
+                let pos = tab
+                    .layout
+                    .tables
+                    .get(&t.key)
+                    .map(|p| pos2(p.x, p.y))
+                    .unwrap_or(pos2(40.0, 40.0));
+                let mut size = tab.node_sizes.get(i).copied().unwrap_or(vec2(MIN_W, HEADER_H));
+                if collapsed(tab, &t.key) {
+                    size.y = HEADER_H;
+                }
+                let target = Rect::from_min_size(pos, size);
+                for s in edges(bounds.min.x, bounds.max.x) {
+                    for e in edges(target.min.x, target.max.x) {
+                        let d = e - s;
+                        if d.abs() <= thresh && best_x.is_none_or(|(bd, ..)| d.abs() < bd) {
+                            best_x = Some((d.abs(), d, e, target));
+                        }
+                    }
+                }
+                for s in edges(bounds.min.y, bounds.max.y) {
+                    for e in edges(target.min.y, target.max.y) {
+                        let d = e - s;
+                        if d.abs() <= thresh && best_y.is_none_or(|(bd, ..)| d.abs() < bd) {
+                            best_y = Some((d.abs(), d, e, target));
+                        }
+                    }
+                }
+            }
+            snap.x = best_x.map_or(0.0, |(_, d, ..)| d);
+            snap.y = best_y.map_or(0.0, |(_, d, ..)| d);
+            if let Some((_, _, x, tr)) = best_x {
+                let y0 = (bounds.min.y + snap.y).min(tr.min.y);
+                let y1 = (bounds.max.y + snap.y).max(tr.max.y);
+                snap_guides.push((pos2(x, y0), pos2(x, y1)));
+            }
+            if let Some((_, _, y, tr)) = best_y {
+                let x0 = (bounds.min.x + snap.x).min(tr.min.x);
+                let x1 = (bounds.max.x + snap.x).max(tr.max.x);
+                snap_guides.push((pos2(x0, y), pos2(x1, y)));
+            }
+        }
+
+        for (key, start, _) in &origin {
+            let p = *start + accum + snap;
+            let entry = ensure_pos(tab, key);
+            entry.x = p.x;
+            entry.y = p.y;
         }
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         ui.ctx().request_repaint();
@@ -191,6 +288,7 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
     let drag_active = ui.input(|i| i.pointer.any_down());
     if !drag_active && tab.drag.is_some() {
         let was = tab.drag.take();
+        tab.drag_origin.clear();
         if was != Some(DragKind::Pan) {
             tab.save_layout();
         }
@@ -409,10 +507,46 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab) {
             );
         }
     }
+
+    // Snap guides on top of everything.
+    let guide_stroke = Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.85));
+    for (a, b) in &snap_guides {
+        painter.extend(egui::Shape::dashed_line(
+            &[to_screen(*a), to_screen(*b)],
+            guide_stroke,
+            6.0,
+            4.0,
+        ));
+    }
 }
 
 fn collapsed(tab: &DiagramTab, key: &str) -> bool {
     tab.layout.tables.get(key).is_some_and(|p| p.collapsed)
+}
+
+/// Capture start positions and effective sizes of the tables about to be
+/// dragged so snapped positions can be recomputed from raw pointer travel
+/// every frame.
+fn begin_drag(tab: &mut DiagramTab, model: &DiagramModel, indices: &[usize]) {
+    tab.drag_accum = Vec2::ZERO;
+    let origin: Vec<(String, Pos2, Vec2)> = indices
+        .iter()
+        .map(|&ti| {
+            let key = model.tables[ti].key.clone();
+            let pos = tab
+                .layout
+                .tables
+                .get(&key)
+                .map(|p| pos2(p.x, p.y))
+                .unwrap_or(pos2(40.0, 40.0));
+            let mut size = tab.node_sizes.get(ti).copied().unwrap_or(vec2(MIN_W, HEADER_H));
+            if collapsed(tab, &key) {
+                size.y = HEADER_H;
+            }
+            (key, pos, size)
+        })
+        .collect();
+    tab.drag_origin = origin;
 }
 
 fn ensure_pos<'a>(tab: &'a mut DiagramTab, key: &str) -> &'a mut TablePos {
