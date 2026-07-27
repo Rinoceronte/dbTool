@@ -15,3 +15,4 @@ pub mod settings;
 pub mod snippets;
 pub mod sql_complete;
 pub mod ui;
+pub mod update;

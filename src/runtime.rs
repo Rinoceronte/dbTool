@@ -142,6 +142,10 @@ pub enum Command {
     AuthStatus { req: RequestId },
     AuthLogin { req: RequestId, use_console: bool },
     AuthLogout { req: RequestId },
+    /// Ask GitHub for the latest release (startup, fire-and-forget).
+    CheckForUpdate,
+    /// Download the Windows installer and run it silently.
+    ApplyUpdate { url: String, version: String },
 }
 
 #[derive(Debug)]
@@ -219,6 +223,12 @@ pub enum Event {
     Ai { session: SessionId, event: SessionEvent },
     /// The session task ended (any reason). Emitted after the final SessionEvent.
     AiSessionEnded { session: SessionId },
+    /// A newer release exists on GitHub.
+    UpdateAvailable { info: crate::update::UpdateInfo },
+    /// The Windows installer was downloaded and launched; the app should exit
+    /// so the installer can replace it (it relaunches dbTool when done).
+    UpdateInstallerLaunched,
+    UpdateFailed { error: String },
     AuthStatusResult { req: RequestId, status: AuthStatus },
     AuthLoginResult { req: RequestId, success: bool, output: String },
     AuthLogoutResult { req: RequestId, output: String },
@@ -724,6 +734,25 @@ async fn handle_command(
             Ok(output) => send(&evt_tx, &ctx, Event::AuthLogoutResult { req, output }),
             Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
         },
+
+        Command::CheckForUpdate => match crate::update::check().await {
+            Ok(Some(info)) => send(&evt_tx, &ctx, Event::UpdateAvailable { info }),
+            Ok(None) => {}
+            // Startup check stays silent on failure (offline, rate limit, …).
+            Err(e) => log::warn!("update check failed: {e:#}"),
+        },
+
+        Command::ApplyUpdate { url, version } => {
+            let result = async {
+                let path = crate::update::download_installer(&url, &version).await?;
+                crate::update::launch_installer(&path)
+            }
+            .await;
+            match result {
+                Ok(()) => send(&evt_tx, &ctx, Event::UpdateInstallerLaunched),
+                Err(e) => send(&evt_tx, &ctx, Event::UpdateFailed { error: format!("{e:#}") }),
+            }
+        }
 
         Command::DumpDdl { req, conn, schemas, dir } => {
             let Some(driver) = get_driver(&connections, conn).await else {

@@ -26,6 +26,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 urlencoding = "2"
 
 # utilities
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 csv = "1"
 notify-rust = { version = "4", default-features = false, features = ["d"] }
 anyhow = "1"

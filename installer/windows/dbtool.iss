@@ -29,6 +29,11 @@ Source: "..\..\target\release\dbtool.exe"; DestDir: "{app}"; DestName: "dbTool.e
 [Icons]
 Name: "{userprograms}\{#AppName}"; Filename: "{app}\dbTool.exe"; WorkingDir: "{app}"
 
+[Run]
+; No `skipifsilent`: the in-app auto-updater runs this installer with /SILENT
+; and relies on this entry to relaunch dbTool after the file swap.
+Filename: "{app}\dbTool.exe"; Description: "Launch {#AppName}"; Flags: nowait postinstall
+
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
   ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}'))
