@@ -12,7 +12,7 @@ egui_extras = { version = "0.28", features = [] }
 
 # async / DB
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "json", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "json", "chrono", "uuid", "bigdecimal"] }
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -27,6 +27,8 @@ urlencoding = "2"
 
 # utilities
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+fake = "2.9"
+rand = "0.8"
 csv = "1"
 notify-rust = { version = "4", default-features = false, features = ["d"] }
 anyhow = "1"

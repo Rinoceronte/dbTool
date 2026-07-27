@@ -92,7 +92,10 @@ fn mysql_value_from_row(row: &MySqlRow, idx: usize) -> Value {
         "BIGINT" | "BIGINT UNSIGNED" => try_as!(i64, Value::Int),
         "FLOAT" => try_as!(f32, |v| Value::Float(v as f64)),
         "DOUBLE" => try_as!(f64, Value::Float),
-        "DECIMAL" | "NUMERIC" => try_as!(String, Value::Text),
+        // Same as Postgres NUMERIC: sqlx won't decode DECIMAL as String.
+        "DECIMAL" | "NUMERIC" => try_as!(sqlx::types::BigDecimal, |v: sqlx::types::BigDecimal| {
+            Value::Text(v.to_string())
+        }),
         "JSON" => try_as!(serde_json::Value, Value::Json),
         "BLOB" | "LONGBLOB" | "MEDIUMBLOB" | "TINYBLOB" | "VARBINARY" | "BINARY" => {
             try_as!(Vec<u8>, Value::Bytes)

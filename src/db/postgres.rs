@@ -160,7 +160,11 @@ fn pg_value_from_row(row: &PgRow, idx: usize) -> Value {
         "INT8" => try_as!(i64, Value::Int),
         "FLOAT4" => try_as!(f32, |v| Value::Float(v as f64)),
         "FLOAT8" => try_as!(f64, Value::Float),
-        "NUMERIC" => try_as!(String, Value::Text),
+        // sqlx type-checks decodes: NUMERIC never decodes as String, so it
+        // needs BigDecimal (kept as Text to preserve arbitrary precision).
+        "NUMERIC" => try_as!(sqlx::types::BigDecimal, |v: sqlx::types::BigDecimal| {
+            Value::Text(v.to_string())
+        }),
         "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => try_as!(String, Value::Text),
         "UUID" => try_as!(uuid::Uuid, |v: uuid::Uuid| Value::Text(v.to_string())),
         "JSON" | "JSONB" => try_as!(serde_json::Value, Value::Json),
