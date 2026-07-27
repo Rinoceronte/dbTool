@@ -5,6 +5,8 @@ use dbtool::app::App;
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
+    // `mut` is only exercised by the Linux backend override below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
