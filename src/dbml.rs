@@ -62,6 +62,69 @@ pub struct DbmlError {
     pub line: Option<usize>,
 }
 
+/// Directory holding all DBML documents (`~/.config/dbTool/dbml`).
+pub fn dbml_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("dbTool")
+        .join("dbml")
+}
+
+/// The database-owned DBML document, keyed by database name so every
+/// connection to the same database (tunnel, second profile, renamed
+/// profile) shares one document. Legacy documents carried a profile-id
+/// suffix instead; the first lookup that finds one renames it (and its
+/// layout sidecar) to the plain name, so nothing the user wrote is lost.
+pub fn database_dbml_path(
+    profile_id: uuid::Uuid,
+    database: &str,
+    is_primary: bool,
+) -> std::path::PathBuf {
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect()
+    };
+    let dir = dbml_dir();
+    let preferred = dir.join(format!("{}.dbml", safe(database)));
+    if preferred.exists() {
+        return preferred;
+    }
+    // Legacy scheme: `<anything>-<8-char profile id>.dbml` for the primary
+    // database, with a `-<database>` tail for toggled-on databases.
+    let short = &profile_id.simple().to_string()[..8];
+    let suffix = if is_primary {
+        format!("-{short}.dbml")
+    } else {
+        format!("-{short}-{}.dbml", safe(database))
+    };
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if !e.file_name().to_string_lossy().ends_with(&suffix) {
+                continue;
+            }
+            let legacy = e.path();
+            if std::fs::rename(&legacy, &preferred).is_err() {
+                return legacy;
+            }
+            let legacy_sidecar = sidecar_layout_path(&legacy);
+            if legacy_sidecar.exists() {
+                let _ = std::fs::rename(&legacy_sidecar, sidecar_layout_path(&preferred));
+            }
+            return preferred;
+        }
+    }
+    preferred
+}
+
+/// `<dbml path>.layout.json` — the layout sidecar next to a document.
+/// `DiagramLayout::sidecar_path` delegates here.
+pub fn sidecar_layout_path(dbml_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = dbml_path.as_os_str().to_owned();
+    s.push(".layout.json");
+    std::path::PathBuf::from(s)
+}
+
 pub fn parse(input: &str) -> Result<DiagramModel, DbmlError> {
     // Syntax-only parse: dbml-rs's semantic analyzer rejects valid dbdiagram
     // constructs (e.g. composite PKs as multiple [pk] columns). We resolve

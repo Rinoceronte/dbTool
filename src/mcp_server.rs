@@ -1,7 +1,9 @@
-//! Tiny in-process HTTP MCP server. Exposes `run_select` and `run_statement`
+//! Tiny in-process HTTP MCP server. Exposes the SQL tools (`run_select`,
+//! `run_statement`) and DBML tools (`list_dbml`, `read_dbml`, `update_dbml`)
 //! to the `claude` CLI so the agent can act on the user's selected database
-//! connection. Approval gating happens here: `tools/call` blocks the JSON-RPC
-//! response until the user approves (or rejects) writes.
+//! connection and diagram documents. Approval gating happens here:
+//! `tools/call` blocks the JSON-RPC response until the user approves (or
+//! rejects) writes.
 //!
 //! Protocol: MCP "Streamable HTTP" transport, single POST endpoint, JSON-RPC 2.0.
 //! We implement the minimum: `initialize`, `tools/list`, `tools/call`, plus
@@ -21,7 +23,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::ai_session::{ApprovalDecision, SessionEvent};
-use crate::ai_tools::{self, RUN_SELECT, RUN_STATEMENT, ToolCall, ToolKind};
+use crate::ai_tools::{
+    self, FOCUS_TABLE, LIST_DBML, PROPOSE_SQL, READ_DBML, READ_EDITOR, RUN_SELECT, RUN_STATEMENT,
+    UPDATE_DBML, ToolCall, ToolKind,
+};
 use crate::db::DynDriver;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -102,7 +107,12 @@ impl McpServer {
 
     /// MCP tool names as they appear in `--allowed-tools`.
     pub fn allowed_tools_arg() -> String {
-        format!("mcp__dbtool__{RUN_SELECT},mcp__dbtool__{RUN_STATEMENT}")
+        [
+            RUN_SELECT, RUN_STATEMENT, LIST_DBML, READ_DBML, UPDATE_DBML, FOCUS_TABLE,
+            READ_EDITOR, PROPOSE_SQL,
+        ]
+            .map(|t| format!("mcp__dbtool__{t}"))
+            .join(",")
     }
 }
 
@@ -196,7 +206,6 @@ async fn call_tool(state: &Arc<ServerState>, params: Json) -> anyhow::Result<Jso
 
     let kind = call.kind();
     let needs_approval = matches!(kind, ToolKind::Write) && !allow_writes;
-    let sql = call.sql().unwrap_or("").to_string();
 
     let _ = events_tx.send(SessionEvent::ToolStart {
         tool_use_id: call.id.clone(),
@@ -205,7 +214,8 @@ async fn call_tool(state: &Arc<ServerState>, params: Json) -> anyhow::Result<Jso
     let _ = events_tx.send(SessionEvent::ToolReady {
         tool_use_id: call.id.clone(),
         name: call.name.clone(),
-        sql,
+        sql: call.approval_preview(),
+        dbml_file: call.dbml_file().map(str::to_string),
         needs_approval,
     });
 
@@ -236,24 +246,25 @@ async fn call_tool(state: &Arc<ServerState>, params: Json) -> anyhow::Result<Jso
         }
     }
 
-    let Some(driver) = driver else {
-        let _ = events_tx.send(SessionEvent::ToolResult {
-            tool_use_id: call.id.clone(),
-            ok: false,
-            summary: "no connection".into(),
-        });
-        return Ok(json!({
-            "isError": true,
-            "content": [{ "type": "text", "text": "no database connection is selected; pick one in the AI panel" }]
-        }));
-    };
-
-    let outcome = ai_tools::execute(&call, &driver).await;
+    let outcome = ai_tools::execute(&call, driver.as_ref()).await;
     let _ = events_tx.send(SessionEvent::ToolResult {
         tool_use_id: call.id.clone(),
         ok: !outcome.is_error,
         summary: short_summary(&outcome.content),
     });
+    if !outcome.is_error {
+        if let (UPDATE_DBML, Some(file)) = (call.name.as_str(), call.dbml_file()) {
+            let _ = events_tx.send(SessionEvent::DbmlUpdated { file: file.to_string() });
+        }
+        if call.name == FOCUS_TABLE {
+            if let (Some(file), Some(table)) = (call.dbml_file(), call.dbml_table()) {
+                let _ = events_tx.send(SessionEvent::DbmlFocus {
+                    file: file.to_string(),
+                    table: table.to_string(),
+                });
+            }
+        }
+    }
     Ok(json!({
         "isError": outcome.is_error,
         "content": [{ "type": "text", "text": outcome.content }]

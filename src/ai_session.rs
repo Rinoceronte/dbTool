@@ -12,7 +12,6 @@ use serde_json::Value as Json;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -42,11 +41,22 @@ pub enum SessionEvent {
     ToolReady {
         tool_use_id: String,
         name: String,
+        /// Display text for the tool card: the SQL for SQL tools, a change
+        /// preview for DBML tools.
         sql: String,
+        /// For DBML tools, the target file — lets the card open the diagram
+        /// instead of a SQL editor.
+        dbml_file: Option<String>,
         needs_approval: bool,
     },
     /// Tool call resolved (executed or rejected). `summary` is short text for the UI.
     ToolResult { tool_use_id: String, ok: bool, summary: String },
+    /// A DBML document was written via `update_dbml`; the app reloads any
+    /// clean diagram tab open on it. `file` is the basename in the dbml dir.
+    DbmlUpdated { file: String },
+    /// `focus_table` succeeded: open/raise the diagram tab for `file` and
+    /// center the view on `table`.
+    DbmlFocus { file: String, table: String },
     /// Turn finished cleanly. `claude_session_id` is the ID we'll pass to
     /// `--resume` for follow-up turns to keep conversation continuity.
     TurnDone { claude_session_id: Option<String> },
@@ -92,7 +102,7 @@ async fn run_inner(
     // Windows caps the CreateProcess command line at ~32K chars, which a
     // schema-bearing system prompt easily exceeds — so the prompt goes in
     // through stdin and the system prompt through a temp file.
-    let mut cmd = Command::new(crate::claude_auth::cli_program());
+    let mut cmd = crate::claude_auth::cli_command();
     cmd.arg("-p")
         .arg("--output-format").arg("stream-json")
         .arg("--include-partial-messages")

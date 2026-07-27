@@ -4,12 +4,13 @@ use crate::ai_session::{SessionEvent, SessionId};
 use crate::db::{TableKind, TableMeta};
 use crate::ui::ActiveConnection;
 
-const DEFAULT_MODEL: &str = "claude-opus-4-8";
+const DEFAULT_MODEL: &str = "claude-opus-5";
 
 const MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-8", "Opus 4.8 (recommended)"),
+    ("claude-opus-5", "Opus 5 (recommended)"),
     ("claude-fable-5", "Fable 5 (most capable)"),
     ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-opus-4-8", "Opus 4.8"),
     ("claude-haiku-4-5", "Haiku 4.5 (fastest)"),
 ];
 
@@ -28,7 +29,11 @@ pub enum ChatItem {
     Tool {
         id: String,
         name: String,
+        /// Display text: SQL for SQL tools, a change preview for DBML tools.
         sql: Option<String>,
+        /// For DBML tools, the target file — the card links to the diagram
+        /// instead of the SQL editor.
+        dbml_file: Option<String>,
         status: ToolStatus,
         summary: Option<String>,
     },
@@ -96,14 +101,16 @@ impl AiPanelState {
                     id: tool_use_id,
                     name,
                     sql: None,
+                    dbml_file: None,
                     status: ToolStatus::Streaming,
                     summary: None,
                 });
             }
-            SessionEvent::ToolReady { tool_use_id, sql, needs_approval, .. } => {
+            SessionEvent::ToolReady { tool_use_id, sql, dbml_file, needs_approval, .. } => {
                 if let Some(item) = self.find_tool_mut(&tool_use_id) {
-                    if let ChatItem::Tool { sql: s, status, .. } = item {
+                    if let ChatItem::Tool { sql: s, dbml_file: f, status, .. } = item {
                         *s = Some(sql);
+                        *f = dbml_file;
                         *status = if needs_approval {
                             ToolStatus::AwaitingApproval
                         } else {
@@ -120,6 +127,9 @@ impl AiPanelState {
                     }
                 }
             }
+            // Handled by the app (diagram tab reload / view focus); nothing to
+            // show here — the ToolResult card already reports the action.
+            SessionEvent::DbmlUpdated { .. } | SessionEvent::DbmlFocus { .. } => {}
             SessionEvent::TurnDone { claude_session_id } => {
                 if let Some(id) = claude_session_id {
                     self.claude_session_id = Some(id);
@@ -183,6 +193,21 @@ pub enum AiPanelAction {
         profile_id: Option<Uuid>,
         sql: String,
     },
+    OpenDbmlDiagram {
+        file: String,
+    },
+    /// User clicked "Replace query" on a SQL card: put the SQL into the
+    /// active query tab's buffer.
+    ReplaceSqlInActiveTab {
+        sql: String,
+    },
+}
+
+/// What a tool card's buttons asked for.
+enum CardAction {
+    OpenSql(String),
+    ReplaceSql(String),
+    OpenDbml(String),
 }
 
 pub fn draw(
@@ -275,7 +300,7 @@ pub fn draw(
 
             // History scrollback
             let history_height = ui.available_height() - 140.0;
-            let mut open_in_editor: Option<String> = None;
+            let mut card_action: Option<CardAction> = None;
             egui::ScrollArea::vertical()
                 .id_source("ai_history_scroll")
                 .auto_shrink([false, false])
@@ -285,9 +310,9 @@ pub fn draw(
                     // Salt each item's scope: repeated widgets ("result"
                     // collapsers, buttons) would otherwise clash ids.
                     for (idx, item) in state.display.iter().enumerate() {
-                        let sql = ui.push_id(("ai_item", idx), |ui| render_item(ui, item)).inner;
-                        if let Some(sql) = sql {
-                            open_in_editor = Some(sql);
+                        let act = ui.push_id(("ai_item", idx), |ui| render_item(ui, item)).inner;
+                        if let Some(act) = act {
+                            card_action = Some(act);
                         }
                         ui.add_space(6.0);
                     }
@@ -295,11 +320,20 @@ pub fn draw(
                         ui.weak("…thinking");
                     }
                 });
-            if let Some(sql) = open_in_editor {
-                action = AiPanelAction::OpenSqlInEditor {
-                    profile_id: state.selected_profile,
-                    sql,
-                };
+            match card_action {
+                Some(CardAction::OpenSql(sql)) => {
+                    action = AiPanelAction::OpenSqlInEditor {
+                        profile_id: state.selected_profile,
+                        sql,
+                    };
+                }
+                Some(CardAction::ReplaceSql(sql)) => {
+                    action = AiPanelAction::ReplaceSqlInActiveTab { sql };
+                }
+                Some(CardAction::OpenDbml(file)) => {
+                    action = AiPanelAction::OpenDbmlDiagram { file };
+                }
+                None => {}
             }
 
             ui.separator();
@@ -427,8 +461,8 @@ pub fn draw(
     action
 }
 
-fn render_item(ui: &mut egui::Ui, item: &ChatItem) -> Option<String> {
-    let mut open_in_editor: Option<String> = None;
+fn render_item(ui: &mut egui::Ui, item: &ChatItem) -> Option<CardAction> {
+    let mut card_action: Option<CardAction> = None;
     match item {
         ChatItem::User(text) => {
             ui.colored_label(egui::Color32::LIGHT_BLUE, "You");
@@ -438,7 +472,7 @@ fn render_item(ui: &mut egui::Ui, item: &ChatItem) -> Option<String> {
             ui.colored_label(egui::Color32::LIGHT_GREEN, "Claude");
             ui.label(text);
         }
-        ChatItem::Tool { name, sql, status, summary, .. } => {
+        ChatItem::Tool { name, sql, dbml_file, status, summary, .. } => {
             let (icon, color) = match status {
                 ToolStatus::Streaming => ("◌", egui::Color32::GRAY),
                 ToolStatus::AwaitingApproval => ("?", egui::Color32::YELLOW),
@@ -453,12 +487,31 @@ fn render_item(ui: &mut egui::Ui, item: &ChatItem) -> Option<String> {
             });
             if let Some(sql) = sql {
                 ui.code(sql);
+                let is_sql_tool = matches!(
+                    name.as_str(),
+                    crate::ai_tools::RUN_SELECT
+                        | crate::ai_tools::RUN_STATEMENT
+                        | crate::ai_tools::PROPOSE_SQL
+                );
                 ui.horizontal(|ui| {
                     if ui.small_button("Copy").clicked() {
                         ui.output_mut(|o| o.copied_text = sql.clone());
                     }
-                    if ui.small_button("Open in editor").clicked() {
-                        open_in_editor = Some(sql.clone());
+                    if let Some(file) = dbml_file {
+                        if ui.small_button("Open diagram").clicked() {
+                            card_action = Some(CardAction::OpenDbml(file.clone()));
+                        }
+                    } else if is_sql_tool {
+                        if ui.small_button("Open in editor").clicked() {
+                            card_action = Some(CardAction::OpenSql(sql.clone()));
+                        }
+                        if ui
+                            .small_button("Replace query")
+                            .on_hover_text("Replace the active query tab's SQL with this")
+                            .clicked()
+                        {
+                            card_action = Some(CardAction::ReplaceSql(sql.clone()));
+                        }
                     }
                 });
             }
@@ -485,7 +538,7 @@ fn render_item(ui: &mut egui::Ui, item: &ChatItem) -> Option<String> {
             ui.weak(msg);
         }
     }
-    open_in_editor
+    card_action
 }
 
 fn build_system_prompt(profile: Option<Uuid>, active: &[ActiveConnection]) -> String {
@@ -495,7 +548,26 @@ fn build_system_prompt(profile: Option<Uuid>, active: &[ActiveConnection]) -> St
                 directly when a question can be answered from the data; explain results \
                 concisely. For any statement that modifies data or schema, the user will \
                 be prompted to approve it — keep your statements minimal and idempotent \
-                where possible.";
+                where possible.\n\
+                \n\
+                You can also work with the user's DBML diagram documents via `list_dbml`, \
+                `read_dbml`, and `update_dbml` (edits also require approval). When the \
+                user talks about \"the DBML\", the diagram, groups, or notes, use these \
+                tools — not SQL. Each database-owned document has a dbTool-generated \
+                region between marker comments — never edit inside it; it is overwritten \
+                when the user refreshes from the database. Below the markers is the \
+                user's area for `TableGroup` blocks, notes, colors, and draft tables — \
+                make organizational edits there. Prefer small `find`/`replace` edits over \
+                rewriting whole files. The user can see the diagram live: `focus_table` \
+                pans their view to a table, so use it to show where you are working — \
+                e.g. focus a table right before or after you change it.\n\
+                \n\
+                When the user refers to \"this query\", \"my query\", or their editor, \
+                call `read_editor` to see the SQL in their active query tab. To hand \
+                back a revised or suggested query without running it, call `propose_sql` \
+                — the user gets one-click actions to copy it, open it in a new tab, or \
+                replace their current query. You cannot write into their editor \
+                directly; propose and let them apply.";
 
     let Some(profile) = profile else {
         return format!("{base}\n\nNo database connection is currently selected — your tools will fail until the user picks one.");
@@ -512,11 +584,24 @@ fn build_system_prompt(profile: Option<Uuid>, active: &[ActiveConnection]) -> St
     let mut out = String::new();
     out.push_str(base);
     out.push_str(&format!(
-        "\n\nConnected to `{}` (dialect: {:?}). Default schema: `{}`.\n\n",
+        "\n\nConnected to `{}` (dialect: {:?}). Default schema: `{}`.\n",
         ac.name,
         ac.kind,
         cache.default_schema()
     ));
+    let dbml_path =
+        crate::dbml::database_dbml_path(ac.profile_id, &ac.database, ac.is_primary);
+    if let Some(file) = dbml_path.file_name().map(|f| f.to_string_lossy().to_string()) {
+        if dbml_path.exists() {
+            out.push_str(&format!("DBML document for this connection: `{file}`.\n"));
+        } else {
+            out.push_str(
+                "No DBML document exists for this connection yet (the user can generate \
+                 one via View as DBML).\n",
+            );
+        }
+    }
+    out.push('\n');
     out.push_str("Schema reference:\n");
     let mut by_schema: std::collections::BTreeMap<&str, Vec<&TableMeta>> =
         std::collections::BTreeMap::new();

@@ -85,6 +85,11 @@ pub struct App {
     tabs: Vec<Tab>,
     active_tab: Option<TabId>,
     status: Option<String>,
+    /// A newer GitHub release, surfaced as a top-bar banner.
+    update_banner: Option<crate::update::UpdateInfo>,
+    update_downloading: bool,
+    /// The update installer is running; close the window so it can replace us.
+    quit_for_update: bool,
     test_probe_conn: Option<ConnectionId>,
     ai_panel: AiPanelState,
     auth: AuthState,
@@ -228,6 +233,9 @@ impl App {
             tabs: Vec::new(),
             active_tab: None,
             status: None,
+            update_banner: None,
+            update_downloading: false,
+            quit_for_update: false,
             test_probe_conn: None,
             ai_panel: AiPanelState::default(),
             auth: AuthState::default(),
@@ -283,6 +291,7 @@ impl App {
         }
         // Probe Claude auth status at startup so the panel populates lazily.
         app.send(Pending::AuthStatus, |req| Command::AuthStatus { req });
+        app.runtime.send(Command::CheckForUpdate);
         app
     }
 
@@ -915,12 +924,31 @@ impl App {
                 }
             }
             Event::Ai { session, event } => {
+                match &event {
+                    crate::ai_session::SessionEvent::DbmlUpdated { file } => {
+                        self.reload_diagram_tabs_from_disk(&file.clone());
+                    }
+                    crate::ai_session::SessionEvent::DbmlFocus { file, table } => {
+                        self.focus_diagram_table(&file.clone(), &table.clone());
+                    }
+                    _ => {}
+                }
                 if self.ai_panel.current_session == Some(session) {
                     self.ai_panel.apply_session_event(event);
                 }
             }
             Event::AiSessionEnded { session } => {
                 self.ai_panel.session_ended(session);
+            }
+            Event::UpdateAvailable { info } => {
+                self.update_banner = Some(info);
+            }
+            Event::UpdateInstallerLaunched => {
+                self.quit_for_update = true;
+            }
+            Event::UpdateFailed { error } => {
+                self.update_downloading = false;
+                self.status = Some(format!("Update failed: {error}"));
             }
             Event::AuthStatusResult { req, status } => {
                 let Some(op) = self.pending.remove(&req) else { return };
@@ -1102,10 +1130,10 @@ impl App {
                         }
                         let text = crate::dbml::generate_document(&tables, &name);
                         let path =
-                            self.database_dbml_path(source.0, &source.1, is_primary, &name);
-                        if let Err(e) = std::fs::create_dir_all(Self::dbml_dir()) {
+                            crate::dbml::database_dbml_path(source.0, &source.1, is_primary);
+                        if let Err(e) = std::fs::create_dir_all(crate::dbml::dbml_dir()) {
                             self.status =
-                                Some(format!("Could not create {}: {e}", Self::dbml_dir().display()));
+                                Some(format!("Could not create {}: {e}", crate::dbml::dbml_dir().display()));
                             return;
                         }
                         if let Err(e) = std::fs::write(&path, &text) {
@@ -1884,45 +1912,108 @@ impl App {
         self.active_tab = Some(id);
     }
 
-    fn dbml_dir() -> std::path::PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("dbTool")
-            .join("dbml")
+
+    /// Mirror the active query tab into the shared slot the AI's
+    /// `read_editor` tool reads from (cheap no-op when nothing changed).
+    fn publish_editor_snapshot(&self) {
+        let snap = self.active_tab.and_then(|id| {
+            self.tabs.iter().find_map(|t| match t {
+                Tab::Query(q) if q.id == id => {
+                    let connection = self
+                        .active
+                        .iter()
+                        .find(|a| a.conn_id == q.conn_id)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_default();
+                    Some(crate::ai_tools::EditorSnapshot {
+                        connection,
+                        title: q.title.clone(),
+                        sql: q.sql.clone(),
+                    })
+                }
+                _ => None,
+            })
+        });
+        crate::ai_tools::set_active_editor(snap);
     }
 
-    /// The database-owned DBML document. Identified by a short profile-id
-    /// suffix (plus the database name for toggled-on databases) so it
-    /// survives connection renames; the readable part is just for humans.
-    /// The primary database keeps the pre-multi-DB suffix, so existing
-    /// documents still open.
-    fn database_dbml_path(
-        &self,
-        profile_id: Uuid,
-        database: &str,
-        is_primary: bool,
-        name: &str,
-    ) -> std::path::PathBuf {
-        let safe = |s: &str| -> String {
-            s.chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                .collect()
+    /// "Replace query" on an AI SQL card: overwrite the active query tab's
+    /// buffer. User-initiated, so no dirty-check — undo (Ctrl+Z) still works.
+    fn replace_sql_in_active_tab(&mut self, sql: String) {
+        let Some(id) = self.active_tab else {
+            self.status = Some("Focus a query tab to replace its SQL".into());
+            return;
         };
-        let short = &profile_id.simple().to_string()[..8];
-        let suffix = if is_primary {
-            format!("-{short}.dbml")
-        } else {
-            format!("-{short}-{}.dbml", safe(database))
+        let Some(Tab::Query(q)) = self.find_tab_mut(id) else {
+            self.status = Some("Focus a query tab to replace its SQL".into());
+            return;
         };
-        let dir = Self::dbml_dir();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                if e.file_name().to_string_lossy().ends_with(&suffix) {
-                    return e.path();
-                }
+        q.sql = sql;
+        let title = q.title.clone();
+        self.status = Some(format!("Replaced query in {title}"));
+    }
+
+    /// Open (or raise) the diagram tab for a DBML file in the dbml dir,
+    /// resolving which connection owns it so Refresh keeps working.
+    fn open_dbml_by_name(&mut self, file_name: &str) -> bool {
+        let path = crate::dbml::dbml_dir().join(file_name);
+        if !path.exists() {
+            self.status = Some(format!("{file_name} does not exist"));
+            return false;
+        }
+        let source = self
+            .active
+            .iter()
+            .find(|ac| {
+                crate::dbml::database_dbml_path(ac.profile_id, &ac.database, ac.is_primary)
+                    .file_name()
+                    .is_some_and(|f| f == file_name)
+            })
+            .map(|ac| (ac.profile_id, ac.database.clone()));
+        self.open_diagram_tab(path, source);
+        true
+    }
+
+    /// The AI's `focus_table`: open/raise the document's diagram tab and
+    /// queue a center-on-table request for the canvas.
+    fn focus_diagram_table(&mut self, file_name: &str, table: &str) {
+        if !self.open_dbml_by_name(file_name) {
+            return;
+        }
+        for tab in &mut self.tabs {
+            let Tab::Diagram(d) = tab else { continue };
+            if d.path.file_name().is_some_and(|f| f == file_name) {
+                d.want_focus = Some(table.to_string());
+                break;
             }
         }
-        dir.join(format!("{}{suffix}", safe(name)))
+    }
+
+    /// After the AI writes a DBML file, refresh any open diagram tab on it.
+    /// Tabs with unsaved edits are left alone so nothing is silently lost.
+    fn reload_diagram_tabs_from_disk(&mut self, file_name: &str) {
+        let mut skipped_dirty = false;
+        for tab in &mut self.tabs {
+            let Tab::Diagram(d) = tab else { continue };
+            if d.path.file_name().map_or(true, |f| f != file_name) {
+                continue;
+            }
+            if d.is_dirty() {
+                skipped_dirty = true;
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&d.path) {
+                d.text = text.clone();
+                d.saved_text = text;
+                d.file_mtime =
+                    std::fs::metadata(&d.path).and_then(|m| m.modified()).ok();
+            }
+        }
+        if skipped_dirty {
+            self.status = Some(format!(
+                "AI updated {file_name} on disk, but the open tab has unsaved changes — saving will overwrite the AI's edit"
+            ));
+        }
     }
 
     fn refresh_diagram_from_db(&mut self, tab_id: TabId) {
@@ -2217,6 +2308,12 @@ impl App {
                         );
                     }
                 }
+            }
+            AiPanelAction::OpenDbmlDiagram { file } => {
+                self.open_dbml_by_name(&file);
+            }
+            AiPanelAction::ReplaceSqlInActiveTab { sql } => {
+                self.replace_sql_in_active_tab(sql);
             }
         }
     }
@@ -3504,6 +3601,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.last_input_time = ctx.input(|i| i.time);
         self.window_focused = ctx.input(|i| i.focused);
+        self.publish_editor_snapshot();
         // 1. Drain events.
         let events = self.runtime.drain_events();
         for e in events {
@@ -3512,6 +3610,10 @@ impl eframe::App for App {
         if self.tick_auto_refresh() {
             // Keep frames coming while an auto-refresh interval is armed.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if self.quit_for_update {
+            // The installer is running; get out of its way. It relaunches us.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.draw_param_prompt(ctx);
         self.draw_snippets_popup(ctx);
@@ -3554,6 +3656,46 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.settings_open = !self.settings_open;
+                        }
+                        if let Some(info) = self.update_banner.clone() {
+                            ui.separator();
+                            if self.update_downloading {
+                                ui.spinner();
+                                ui.weak("Downloading update…");
+                            } else if cfg!(windows) && info.installer_url.is_some() {
+                                if ui
+                                    .button(
+                                        egui::RichText::new(format!(
+                                            "⬆ Update to v{}",
+                                            info.version
+                                        ))
+                                        .color(theme::ACCENT),
+                                    )
+                                    .on_hover_text(
+                                        "Download and install the update; \
+                                         dbTool restarts automatically",
+                                    )
+                                    .clicked()
+                                {
+                                    self.update_downloading = true;
+                                    self.runtime.send(Command::ApplyUpdate {
+                                        url: info.installer_url.clone().unwrap(),
+                                        version: info.version.clone(),
+                                    });
+                                }
+                            } else if ui
+                                .button(
+                                    egui::RichText::new(format!(
+                                        "⬆ v{} available",
+                                        info.version
+                                    ))
+                                    .color(theme::ACCENT),
+                                )
+                                .on_hover_text("Open the release download page")
+                                .clicked()
+                            {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(&info.release_url));
+                            }
                         }
                     });
                 });
@@ -4596,7 +4738,7 @@ impl App {
                 // The database's document persists across sessions: open it
                 // if it exists (keeping the user's groups and edits); only
                 // introspect when there is nothing yet.
-                let path = self.database_dbml_path(source.0, &source.1, is_primary, &name);
+                let path = crate::dbml::database_dbml_path(source.0, &source.1, is_primary);
                 if path.exists() {
                     self.open_diagram_tab(path, Some(source));
                     return;
