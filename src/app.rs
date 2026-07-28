@@ -507,6 +507,13 @@ impl App {
                                 schema_cache: None,
                             });
                             self.status = Some("Connected.".into());
+                            // If this profile's database picker is open (e.g.
+                            // a set-primary reconnect), refresh its listing.
+                            if primary && self.db_picker == Some(profile_id) {
+                                self.send(Pending::ListDatabases, move |req| {
+                                    Command::ListDatabases { req, conn }
+                                });
+                            }
                             // Re-attach restored (or orphaned) query tabs
                             // that belong to this profile+database.
                             for t in &mut self.tabs {
@@ -3954,6 +3961,35 @@ impl App {
         }
     }
 
+    /// The accent color of the database a tab belongs to, if one is set —
+    /// tints the tab pill like DataGrip's colored consoles.
+    fn tab_accent(&self, tab: &Tab) -> Option<egui::Color32> {
+        let (profile_id, database) = match tab {
+            Tab::Query(q) => (q.profile_id, Some(q.database.clone())),
+            Tab::TableEditor(t) => (
+                t.profile_id,
+                self.active
+                    .iter()
+                    .find(|a| a.conn_id == t.conn_id)
+                    .map(|a| a.database.clone()),
+            ),
+            Tab::Sessions(s) => (
+                s.profile_id,
+                self.active
+                    .iter()
+                    .find(|a| a.conn_id == s.conn_id)
+                    .map(|a| a.database.clone()),
+            ),
+            _ => return None,
+        };
+        let database = database?;
+        self.profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .and_then(|p| p.database_color(&database))
+            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+    }
+
     fn handle_db_picker_action(&mut self, action: crate::connections::manager_ui::DbPickerAction) {
         use crate::connections::manager_ui::DbPickerAction as P;
         match action {
@@ -3979,6 +4015,77 @@ impl App {
                 if let Err(e) = connections::save_profiles(&self.profiles) {
                     self.status = Some(format!("Failed to save profiles: {e}"));
                 }
+            }
+            P::SetColor { profile_id, database, color } => {
+                if let Some(p) = self.profiles.iter_mut().find(|p| p.id == profile_id) {
+                    match color {
+                        Some(c) => {
+                            p.db_colors.insert(database, c);
+                        }
+                        None => {
+                            p.db_colors.remove(&database);
+                        }
+                    }
+                    if let Err(e) = connections::save_profiles(&self.profiles) {
+                        self.status = Some(format!("Failed to save profiles: {e}"));
+                    }
+                }
+            }
+            P::SetPrimary { profile_id, database } => {
+                let Some(p) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
+                    return;
+                };
+                if p.database == database {
+                    return;
+                }
+                // Swap: the new primary leaves the toggled-on list, the old
+                // primary joins it so it stays visible after the reconnect.
+                let old = std::mem::replace(&mut p.database, database.clone());
+                p.enabled_databases.retain(|d| *d != database);
+                if !old.is_empty() && !p.enabled_databases.contains(&old) {
+                    p.enabled_databases.push(old);
+                    p.enabled_databases.sort();
+                }
+                if let Err(e) = connections::save_profiles(&self.profiles) {
+                    self.status = Some(format!("Failed to save profiles: {e}"));
+                }
+                self.soft_disconnect_profile(profile_id);
+                self.start_connect(profile_id);
+            }
+        }
+    }
+
+    /// Disconnect every connection of a profile while keeping its query tabs
+    /// as detached consoles (they re-attach on reconnect) — used when
+    /// switching the primary database, unlike the tab-closing
+    /// `disconnect_profile`.
+    fn soft_disconnect_profile(&mut self, profile_id: Uuid) {
+        let conn_ids: Vec<ConnectionId> = self
+            .active
+            .iter()
+            .filter(|a| a.profile_id == profile_id)
+            .map(|a| a.conn_id)
+            .collect();
+        for conn in &conn_ids {
+            self.runtime.send(Command::Disconnect { conn: *conn });
+        }
+        self.active.retain(|a| a.profile_id != profile_id);
+        for t in &mut self.tabs {
+            if let Tab::Query(q) = t {
+                if conn_ids.contains(&q.conn_id) {
+                    q.status = TabStatus::Info("disconnected".into());
+                    q.running_req = None;
+                }
+            }
+        }
+        self.tabs.retain(|t| match t {
+            Tab::TableEditor(te) => !conn_ids.contains(&te.conn_id),
+            Tab::Sessions(s) => !conn_ids.contains(&s.conn_id),
+            _ => true,
+        });
+        if let Some(id) = self.active_tab {
+            if !self.tabs.iter().any(|t| t.id() == id) {
+                self.active_tab = self.tabs.first().map(|t| t.id());
             }
         }
     }
@@ -4300,16 +4407,30 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            let ids_titles: Vec<(TabId, String)> =
-                                self.tabs.iter().map(|t| (t.id(), t.title())).collect();
+                            let ids_titles: Vec<(TabId, String, Option<egui::Color32>)> = self
+                                .tabs
+                                .iter()
+                                .map(|t| (t.id(), t.title(), self.tab_accent(t)))
+                                .collect();
                             let mut to_close: Option<TabId> = None;
-                            for (id, title) in ids_titles {
+                            for (id, title, accent) in ids_titles {
                                 let selected = self.active_tab == Some(id);
-                                let (fill, text_color) = if selected {
+                                let (mut fill, text_color) = if selected {
                                     (ui.visuals().selection.bg_fill, ui.visuals().selection.stroke.color)
                                 } else {
                                     (egui::Color32::TRANSPARENT, ui.visuals().text_color())
                                 };
+                                // A database accent tints the pill; the
+                                // selected tab gets a stronger wash.
+                                if let Some(c) = accent {
+                                    let [r, g, b, _] = c.to_array();
+                                    fill = egui::Color32::from_rgba_unmultiplied(
+                                        r,
+                                        g,
+                                        b,
+                                        if selected { 120 } else { 45 },
+                                    );
+                                }
                                 // Title and × are separate, non-overlapping buttons so the
                                 // close click can never be swallowed by a pill-wide widget.
                                 let inner = egui::Frame::none()

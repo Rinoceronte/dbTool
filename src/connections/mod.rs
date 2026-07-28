@@ -29,6 +29,13 @@ pub struct ConnectionProfile {
     /// its own connection and appears as a node in the sidebar tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_databases: Vec<String>,
+    /// Connection-wide accent color; cascades to every database unless a
+    /// `db_colors` entry overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+    /// Per-database accent colors (sidebar node tint), keyed by database name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub db_colors: std::collections::BTreeMap<String, [u8; 3]>,
     // SSH tunnel (system ssh; keys/agent/~/.ssh/config apply as usual).
     #[serde(default)]
     pub ssh_enabled: bool,
@@ -54,6 +61,12 @@ fn default_ssh_port() -> u16 {
 }
 
 impl ConnectionProfile {
+    /// Effective accent color for one of this connection's databases:
+    /// per-database override first, then the connection-wide color.
+    pub fn database_color(&self, database: &str) -> Option<[u8; 3]> {
+        self.db_colors.get(database).copied().or(self.color)
+    }
+
     pub fn new(kind: DbKind) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -66,6 +79,8 @@ impl ConnectionProfile {
             require_ssl: false,
             password_fallback: None,
             enabled_databases: Vec::new(),
+            color: None,
+            db_colors: std::collections::BTreeMap::new(),
             ssh_enabled: false,
             ssh_host: String::new(),
             ssh_port: 22,

@@ -169,13 +169,36 @@ pub fn draw_connection_list(
             let multi = conns.len() > 1;
             ui.indent(("conn_tree", profile.id), |ui| {
                 for conn in conns {
+                    // Reserve a paint slot before the node so a DataGrip-style
+                    // wash in the database's color can be filled in underneath
+                    // the whole subtree (header + expanded schemas/tables).
+                    let wash_idx = ui.painter().add(egui::Shape::Noop);
+                    let node_top = ui.next_widget_position().y;
                     if multi {
-                        let resp = egui::CollapsingHeader::new(
-                            egui::RichText::new(format!("🛢 {}", conn.database)).strong(),
-                        )
+                        // While ctrl is held, freeze the header at its current
+                        // open state so ctrl+click only selects for compare
+                        // and never expands/collapses. The state id is cached
+                        // from last frame's response (the header renders in a
+                        // child Ui, so it can't be derived from this ui's id).
+                        let hid_key = egui::Id::new(("db_node_hid", conn.conn_id));
+                        let frozen_open = if ui.input(|i| i.modifiers.command) {
+                            ui.data(|d| d.get_temp::<egui::Id>(hid_key)).map(|hid| {
+                                egui::collapsing_header::CollapsingState::load(ui.ctx(), hid)
+                                    .map(|st| st.is_open())
+                                    .unwrap_or(conn.is_primary)
+                            })
+                        } else {
+                            None
+                        };
+                        let db_text =
+                            egui::RichText::new(format!("🛢 {}", conn.database)).strong();
+                        let mut header = egui::CollapsingHeader::new(db_text)
                         .id_source(("db_node", conn.conn_id))
-                        .default_open(conn.is_primary)
-                        .show(ui, |ui| {
+                        .default_open(conn.is_primary);
+                        if frozen_open.is_some() {
+                            header = header.open(frozen_open);
+                        }
+                        let resp = header.show(ui, |ui| {
                             let t = schema_tree::draw_tree(ui, conn);
                             if !matches!(t, TreeAction::None) {
                                 tree_action = t;
@@ -201,21 +224,10 @@ pub fn draw_connection_list(
                                 &mut tree_action,
                             );
                         });
+                        ui.data_mut(|d| d.insert_temp(hid_key, resp.header_response.id));
                         if resp.header_response.clicked()
                             && ui.input(|i| i.modifiers.command)
                         {
-                            // Ctrl+click marks the database for compare; undo
-                            // the expand/collapse the same click triggered.
-                            let hid = ui.make_persistent_id(egui::Id::new((
-                                "db_node",
-                                conn.conn_id,
-                            )));
-                            if let Some(mut st) =
-                                egui::collapsing_header::CollapsingState::load(ui.ctx(), hid)
-                            {
-                                st.set_open(!st.is_open());
-                                st.store(ui.ctx());
-                            }
                             toggle_compare_selection(&mut state.compare_selection, conn.conn_id);
                         }
                         if state.compare_selection.contains(&conn.conn_id) {
@@ -230,6 +242,20 @@ pub fn draw_connection_list(
                         if !matches!(t, TreeAction::None) {
                             tree_action = t;
                         }
+                    }
+                    if let Some(c) = profile.database_color(&conn.database) {
+                        let rect = egui::Rect::from_min_max(
+                            egui::pos2(ui.max_rect().left(), node_top - 1.0),
+                            egui::pos2(ui.max_rect().right(), ui.min_rect().bottom() + 1.0),
+                        );
+                        ui.painter().set(
+                            wash_idx,
+                            egui::Shape::rect_filled(
+                                rect,
+                                egui::Rounding::same(4.0),
+                                egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 30),
+                            ),
+                        );
                     }
                 }
             });
@@ -253,6 +279,8 @@ fn draw_conn_row(
     let is_active = primary_conn.is_some();
     let accent = if profile.production {
         theme::PROD_RED
+    } else if let Some(c) = profile.color {
+        egui::Color32::from_rgb(c[0], c[1], c[2])
     } else {
         theme::driver_color(profile.kind)
     };
@@ -468,6 +496,10 @@ pub enum DbPickerAction {
     Close,
     Enable { profile_id: Uuid, database: String },
     Disable { profile_id: Uuid, database: String },
+    /// Set (Some) or clear (None) a database's sidebar accent color.
+    SetColor { profile_id: Uuid, database: String, color: Option<[u8; 3]> },
+    /// Make this database the profile's primary and reconnect.
+    SetPrimary { profile_id: Uuid, database: String },
 }
 
 /// DataGrip-style database toggles: checked databases open their own
@@ -528,25 +560,83 @@ pub fn draw_db_picker(
                                     || active.iter().any(|a| {
                                         a.profile_id == profile.id && &a.database == db
                                     });
-                                let cb = ui.add_enabled(
-                                    !is_own,
-                                    egui::Checkbox::new(&mut on, db.as_str()),
-                                );
-                                if is_own {
-                                    cb.on_hover_text("The connection's own database");
-                                } else if cb.clicked() {
-                                    action = if on {
-                                        DbPickerAction::Enable {
-                                            profile_id: profile.id,
-                                            database: db.clone(),
-                                        }
-                                    } else {
-                                        DbPickerAction::Disable {
-                                            profile_id: profile.id,
-                                            database: db.clone(),
-                                        }
-                                    };
-                                }
+                                ui.horizontal(|ui| {
+                                    let cb = ui.add_enabled(
+                                        !is_own,
+                                        egui::Checkbox::new(&mut on, db.as_str()),
+                                    );
+                                    if is_own {
+                                        cb.on_hover_text("The connection's own database");
+                                    } else if cb.clicked() {
+                                        action = if on {
+                                            DbPickerAction::Enable {
+                                                profile_id: profile.id,
+                                                database: db.clone(),
+                                            }
+                                        } else {
+                                            DbPickerAction::Disable {
+                                                profile_id: profile.id,
+                                                database: db.clone(),
+                                            }
+                                        };
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let saved = profile.db_colors.get(db).copied();
+                                            let mut rgb = saved
+                                                .or(profile.color)
+                                                .unwrap_or([110, 110, 110]);
+                                            let sw = ui.color_edit_button_srgb(&mut rgb);
+                                            if sw.changed() {
+                                                action = DbPickerAction::SetColor {
+                                                    profile_id: profile.id,
+                                                    database: db.clone(),
+                                                    color: Some(rgb),
+                                                };
+                                            }
+                                            sw.on_hover_text(
+                                                "Accent color for this database — overrides \
+                                                 the connection's color",
+                                            );
+                                            if saved.is_some()
+                                                && ui
+                                                    .small_button("🗙")
+                                                    .on_hover_text(
+                                                        "Clear override (inherit the \
+                                                         connection color)",
+                                                    )
+                                                    .clicked()
+                                            {
+                                                action = DbPickerAction::SetColor {
+                                                    profile_id: profile.id,
+                                                    database: db.clone(),
+                                                    color: None,
+                                                };
+                                            }
+                                            if is_own {
+                                                ui.label(
+                                                    egui::RichText::new("primary")
+                                                        .small()
+                                                        .color(ui.visuals().weak_text_color()),
+                                                );
+                                            } else if ui
+                                                .small_button("★")
+                                                .on_hover_text(
+                                                    "Make this the primary database \
+                                                     (reconnects; the current primary \
+                                                     stays toggled on)",
+                                                )
+                                                .clicked()
+                                            {
+                                                action = DbPickerAction::SetPrimary {
+                                                    profile_id: profile.id,
+                                                    database: db.clone(),
+                                                };
+                                            }
+                                        },
+                                    );
+                                });
                             }
                         });
                 }
@@ -695,6 +785,33 @@ pub fn draw_edit_dialog(ctx: &egui::Context, state: &mut ManagerState) -> Manage
                     ui.checkbox(&mut edit.profile.require_ssl, "Require SSL");
                     ui.end_row();
                     }
+
+                    ui.label("Color");
+                    ui.horizontal(|ui| {
+                        let mut rgb = edit.profile.color.unwrap_or([110, 110, 110]);
+                        if ui
+                            .color_edit_button_srgb(&mut rgb)
+                            .on_hover_text(
+                                "Accent color for this connection — cascades to all \
+                                 its databases unless overridden per database",
+                            )
+                            .changed()
+                        {
+                            edit.profile.color = Some(rgb);
+                        }
+                        if edit.profile.color.is_some() {
+                            if ui.small_button("🗙").on_hover_text("Clear color").clicked() {
+                                edit.profile.color = None;
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("none")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
+                    ui.end_row();
 
                     ui.label("");
                     ui.checkbox(&mut edit.profile.production, "Production")
