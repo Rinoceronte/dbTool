@@ -135,24 +135,42 @@ impl AiPanelState {
                     self.claude_session_id = Some(id);
                 }
                 self.current_session = None;
+                self.sweep_stale_tools();
             }
             SessionEvent::Error { message } => {
                 self.display.push(ChatItem::Error(message));
                 self.current_session = None;
-                for item in &mut self.display {
-                    if let ChatItem::Tool { status, .. } = item {
-                        if matches!(status, ToolStatus::AwaitingApproval | ToolStatus::Streaming | ToolStatus::Running) {
-                            *status = ToolStatus::Rejected;
-                        }
-                    }
+                self.sweep_stale_tools();
+            }
+        }
+    }
+
+    /// A finished turn can't still be streaming or waiting on approval — any
+    /// tool left mid-flight is stale and would wedge the approval modal.
+    fn sweep_stale_tools(&mut self) {
+        for item in &mut self.display {
+            if let ChatItem::Tool { status, .. } = item {
+                if matches!(
+                    status,
+                    ToolStatus::AwaitingApproval | ToolStatus::Streaming | ToolStatus::Running
+                ) {
+                    *status = ToolStatus::Rejected;
                 }
             }
+        }
+    }
+
+    /// Locally mark a tool rejected (no session to answer anymore).
+    pub fn reject_tool(&mut self, id: &str) {
+        if let Some(ChatItem::Tool { status, .. }) = self.find_tool_mut(id) {
+            *status = ToolStatus::Rejected;
         }
     }
 
     pub fn session_ended(&mut self, session: SessionId) {
         if self.current_session == Some(session) {
             self.current_session = None;
+            self.sweep_stale_tools();
         }
     }
 
@@ -201,6 +219,11 @@ pub enum AiPanelAction {
     ReplaceSqlInActiveTab {
         sql: String,
     },
+    /// User clicked "Apply mapping" on a propose_mapping card; the payload is
+    /// the tool-input JSON ({mappings: [...], filter?}).
+    ApplyTransferMapping {
+        json: String,
+    },
 }
 
 /// What a tool card's buttons asked for.
@@ -208,6 +231,7 @@ enum CardAction {
     OpenSql(String),
     ReplaceSql(String),
     OpenDbml(String),
+    ApplyMapping(String),
 }
 
 pub fn draw(
@@ -333,6 +357,9 @@ pub fn draw(
                 Some(CardAction::OpenDbml(file)) => {
                     action = AiPanelAction::OpenDbmlDiagram { file };
                 }
+                Some(CardAction::ApplyMapping(json)) => {
+                    action = AiPanelAction::ApplyTransferMapping { json };
+                }
                 None => {}
             }
 
@@ -395,6 +422,7 @@ pub fn draw(
     // Approval modal
     if let Some((tool_use_id, sql)) = state.pending_approval() {
         let mut keep_open = true;
+        let mut resolved: Option<bool> = None;
         let session = state.current_session;
         egui::Window::new("Approve SQL statement")
             .collapsible(false)
@@ -423,13 +451,7 @@ pub fn draw(
                         ).fill(egui::Color32::LIGHT_GREEN))
                         .clicked()
                     {
-                        if let Some(s) = session {
-                            action = AiPanelAction::Approve {
-                                session: s,
-                                tool_use_id: tool_use_id.clone(),
-                                approved: true,
-                            };
-                        }
+                        resolved = Some(true);
                     }
                     if ui
                         .add(egui::Button::new(
@@ -437,23 +459,21 @@ pub fn draw(
                         ).fill(egui::Color32::LIGHT_RED))
                         .clicked()
                     {
-                        if let Some(s) = session {
-                            action = AiPanelAction::Approve {
-                                session: s,
-                                tool_use_id: tool_use_id.clone(),
-                                approved: false,
-                            };
-                        }
+                        resolved = Some(false);
                     }
                 });
             });
         if !keep_open {
-            if let Some(s) = session {
-                action = AiPanelAction::Approve {
-                    session: s,
-                    tool_use_id,
-                    approved: false,
-                };
+            resolved = Some(false);
+        }
+        if let Some(approved) = resolved {
+            match session {
+                Some(s) => {
+                    action = AiPanelAction::Approve { session: s, tool_use_id, approved };
+                }
+                // The turn is already over — there is nothing left to answer;
+                // just clear the card so the modal stops re-opening.
+                None => state.reject_tool(&tool_use_id),
             }
         }
     }
@@ -512,6 +532,13 @@ fn render_item(ui: &mut egui::Ui, item: &ChatItem) -> Option<CardAction> {
                         {
                             card_action = Some(CardAction::ReplaceSql(sql.clone()));
                         }
+                    } else if name == crate::ai_tools::PROPOSE_MAPPING
+                        && ui
+                            .small_button("Apply mapping")
+                            .on_hover_text("Fill the transfer tab's mapping grid with this")
+                            .clicked()
+                    {
+                        card_action = Some(CardAction::ApplyMapping(sql.clone()));
                     }
                 });
             }
@@ -567,7 +594,35 @@ fn build_system_prompt(profile: Option<Uuid>, active: &[ActiveConnection]) -> St
                 back a revised or suggested query without running it, call `propose_sql` \
                 — the user gets one-click actions to copy it, open it in a new tab, or \
                 replace their current query. You cannot write into their editor \
-                directly; propose and let them apply.";
+                directly; propose and let them apply.\n\
+                \n\
+                When the user asks for help moving data between databases (their \
+                Transfer-data tab), call `read_transfer` to see both sides: source and \
+                target connections (the engines can differ) and one pair per TARGET \
+                table with its columns and current mapping. Then call `propose_mapping` \
+                once per table that needs work — name the pair in `target_table`, the \
+                source table to pull from in `table`, and give one \
+                entry per target column: a plain source column, or an `expression` in \
+                the SOURCE engine's SQL dialect for derived values (concatenate \
+                first/last name, build a JSON object from address columns, casts). The \
+                user applies each proposal with one click; you cannot edit the \
+                transfer tab directly. Mind the dialect: || vs CONCAT, \
+                jsonb_build_object only on Postgres sources. For related tables, \
+                either keep primary-key columns mapped so FK values line up verbatim, \
+                or — when a parent pair has new_ids enabled (the target generates \
+                fresh PKs) — map child FK columns with a `lookup` entry that \
+                translates the old key through the parent's captured new-id map.\n\
+                \n\
+                HARD RULE for data transfers and data pulls: you are read-only on \
+                BOTH databases. Never INSERT, UPDATE, DELETE, CREATE, ALTER, or \
+                DROP anything on the source or the target — no helper tables, no \
+                temp tables, no staging views, no index tweaks, not even objects \
+                you plan to clean up afterwards. Every reshaping problem \
+                (deduplication, concatenation, splitting, casting) must be solved \
+                inside the mapping itself with SELECT-side expressions — window \
+                functions like ROW_NUMBER() OVER (...), CASE, CONCAT, string \
+                functions — proposed via `propose_mapping`. The app performs all \
+                writes itself when the user runs the transfer or pull.";
 
     let Some(profile) = profile else {
         return format!("{base}\n\nNo database connection is currently selected — your tools will fail until the user picks one.");

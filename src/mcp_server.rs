@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ai_session::{ApprovalDecision, SessionEvent};
 use crate::ai_tools::{
-    self, FOCUS_TABLE, LIST_DBML, PROPOSE_SQL, READ_DBML, READ_EDITOR, RUN_SELECT, RUN_STATEMENT,
-    UPDATE_DBML, ToolCall, ToolKind,
+    self, FOCUS_TABLE, LIST_DBML, PROPOSE_MAPPING, PROPOSE_SQL, READ_DBML, READ_EDITOR,
+    READ_TRANSFER, RUN_SELECT, RUN_STATEMENT, UPDATE_DBML, ToolCall, ToolKind,
 };
 use crate::db::DynDriver;
 
@@ -109,7 +109,7 @@ impl McpServer {
     pub fn allowed_tools_arg() -> String {
         [
             RUN_SELECT, RUN_STATEMENT, LIST_DBML, READ_DBML, UPDATE_DBML, FOCUS_TABLE,
-            READ_EDITOR, PROPOSE_SQL,
+            READ_EDITOR, PROPOSE_SQL, READ_TRANSFER, PROPOSE_MAPPING,
         ]
             .map(|t| format!("mcp__dbtool__{t}"))
             .join(",")

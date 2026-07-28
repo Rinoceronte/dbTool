@@ -14,6 +14,7 @@ pub mod settings_dialog;
 pub mod table_editor;
 pub mod table_structure;
 pub mod theme;
+pub mod transfer_tab;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -97,6 +98,7 @@ pub enum Tab {
     Compare(compare_tab::CompareTab),
     Sessions(SessionsTab),
     DataSync(datasync_tab::DataSyncTab),
+    Transfer(transfer_tab::TransferTab),
 }
 
 impl Tab {
@@ -108,6 +110,7 @@ impl Tab {
             Tab::Compare(t) => t.id,
             Tab::Sessions(t) => t.id,
             Tab::DataSync(t) => t.id,
+            Tab::Transfer(t) => t.id,
         }
     }
     pub fn title(&self) -> String {
@@ -121,6 +124,7 @@ impl Tab {
             Tab::Compare(_) => "Compare structures".to_owned(),
             Tab::Sessions(t) => format!("Sessions — {}", t.conn_name),
             Tab::DataSync(_) => "Data sync".to_owned(),
+            Tab::Transfer(_) => "Transfer data".to_owned(),
         }
     }
     /// The connection a tab belongs to; `None` for connection-agnostic tabs
@@ -130,7 +134,7 @@ impl Tab {
             Tab::Query(t) => Some(t.profile_id),
             Tab::TableEditor(t) => Some(t.profile_id),
             Tab::Sessions(t) => Some(t.profile_id),
-            Tab::Diagram(_) | Tab::Compare(_) | Tab::DataSync(_) => None,
+            Tab::Diagram(_) | Tab::Compare(_) | Tab::DataSync(_) | Tab::Transfer(_) => None,
         }
     }
 }

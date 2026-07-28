@@ -50,6 +50,11 @@ enum Pending {
     ExplainPlan(TabId),
     /// Source-side introspection for a data-sync tab.
     DataSyncMeta(TabId),
+    /// Source/target introspection for a transfer tab.
+    TransferSrcMeta(TabId),
+    TransferTgtMeta(TabId),
+    /// A running transfer.
+    TransferRun(TabId),
     /// Whole-database dump or restore.
     Backup,
     /// A data-sync tab's compare or pull run.
@@ -995,6 +1000,21 @@ impl App {
                     }
                     return;
                 }
+                if let Pending::TransferSrcMeta(tab_id) | Pending::TransferTgtMeta(tab_id) = op {
+                    let source_side = matches!(op, Pending::TransferSrcMeta(_));
+                    if let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) {
+                        if source_side {
+                            t.source_meta_loading = false;
+                            t.source_meta = Some(meta);
+                        } else {
+                            t.target_meta_loading = false;
+                            t.target_meta = Some(meta);
+                        }
+                        t.remap();
+                        t.error = None;
+                    }
+                    return;
+                }
                 if let Pending::DataSyncMeta(tab_id) = op {
                     let source_profile = self
                         .find_active_by_conn(conn)
@@ -1045,11 +1065,20 @@ impl App {
                 }
             }
             Event::DataProgress { req, message } => {
-                if let Some(Pending::DataSyncRun(tab_id)) = self.pending.get(&req) {
-                    let tab_id = *tab_id;
-                    if let Some(Tab::DataSync(t)) = self.find_tab_mut(tab_id) {
-                        t.progress = message;
+                match self.pending.get(&req) {
+                    Some(Pending::DataSyncRun(tab_id)) => {
+                        let tab_id = *tab_id;
+                        if let Some(Tab::DataSync(t)) = self.find_tab_mut(tab_id) {
+                            t.progress = message;
+                        }
                     }
+                    Some(Pending::TransferRun(tab_id)) => {
+                        let tab_id = *tab_id;
+                        if let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) {
+                            t.progress = message;
+                        }
+                    }
+                    _ => {}
                 }
             }
             Event::DataCompared { req, reports } => {
@@ -1083,6 +1112,25 @@ impl App {
                         } else {
                             t.status = Some(format!(
                                 "Pulled {rows} row(s) across {tables} table(s), with errors."
+                            ));
+                            t.error = Some(errors.join("\n"));
+                        }
+                    }
+                }
+            }
+            Event::DataTransferred { req, tables, rows, errors } => {
+                let Some(op) = self.pending.remove(&req) else { return };
+                if let Pending::TransferRun(tab_id) = op {
+                    if let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) {
+                        t.running = false;
+                        t.progress.clear();
+                        if errors.is_empty() {
+                            t.status =
+                                Some(format!("Transferred {rows} row(s) across {tables} table(s)."));
+                            t.error = None;
+                        } else {
+                            t.status = Some(format!(
+                                "Transferred {rows} row(s) across {tables} table(s), with errors."
                             ));
                             t.error = Some(errors.join("\n"));
                         }
@@ -1350,6 +1398,21 @@ impl App {
                     }
                     Some(Pending::DataSyncRun(tab_id)) => {
                         if let Some(Tab::DataSync(t)) = self.find_tab_mut(tab_id) {
+                            t.running = false;
+                            t.progress.clear();
+                            t.error = Some(error);
+                        }
+                    }
+                    Some(Pending::TransferSrcMeta(tab_id))
+                    | Some(Pending::TransferTgtMeta(tab_id)) => {
+                        if let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) {
+                            t.source_meta_loading = false;
+                            t.target_meta_loading = false;
+                            t.error = Some(error);
+                        }
+                    }
+                    Some(Pending::TransferRun(tab_id)) => {
+                        if let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) {
                             t.running = false;
                             t.progress.clear();
                             t.error = Some(error);
@@ -2315,7 +2378,252 @@ impl App {
             AiPanelAction::ReplaceSqlInActiveTab { sql } => {
                 self.replace_sql_in_active_tab(sql);
             }
+            AiPanelAction::ApplyTransferMapping { json } => {
+                self.apply_transfer_mapping(&json);
+            }
         }
+    }
+
+    /// "Apply mapping" on an AI propose_mapping card: fill one pair of the
+    /// transfer tab's grid from the tool-input JSON. User-initiated, like
+    /// replace_sql_in_active_tab.
+    fn apply_transfer_mapping(&mut self, json: &str) {
+        let Ok(input) = serde_json::from_str::<serde_json::Value>(json) else {
+            self.status = Some("Could not parse the proposed mapping.".into());
+            return;
+        };
+        let Some(tab_id) = self.find_transfer_tab_id() else {
+            self.status =
+                Some("No transfer tab open — right-click a connection → Transfer data…".into());
+            return;
+        };
+        let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) else { return };
+        // Which pair (pairs are keyed by TARGET table): the proposal's
+        // "target_table", else the pair pulling from its "table" (source),
+        // else the only enabled pair.
+        let source_key = input.get("table").and_then(|v| v.as_str()).map(str::to_owned);
+        let tkey = if let Some(tt) = input.get("target_table").and_then(|v| v.as_str()) {
+            if !t.pairs.contains_key(tt) {
+                self.status = Some(format!("Unknown target table in proposal: {tt}"));
+                return;
+            }
+            tt.to_string()
+        } else if let Some(src) = &source_key {
+            // A pair already pulling from that source, else the source key
+            // itself when the AI named the pair by its target.
+            match t.pairs.iter().find(|(_, p)| p.source.as_deref() == Some(src)) {
+                Some((k, _)) => k.clone(),
+                None if t.pairs.contains_key(src) => src.clone(),
+                None => {
+                    self.status = Some(format!("Unknown source table in proposal: {src}"));
+                    return;
+                }
+            }
+        } else {
+            let enabled: Vec<&String> =
+                t.pairs.iter().filter(|(_, p)| p.enabled).map(|(k, _)| k).collect();
+            match enabled.as_slice() {
+                [one] => (*one).clone(),
+                _ => {
+                    self.status = Some(
+                        "The proposal names no table and several pairs are \
+                         selected — could not apply."
+                            .into(),
+                    );
+                    return;
+                }
+            }
+        };
+        // Optional re-pair to a different source table.
+        if let Some(src) = &source_key {
+            let exists = t
+                .source_meta
+                .as_ref()
+                .is_some_and(|m| m.tables.iter().any(|tm| {
+                    format!("{}.{}", tm.schema, tm.name) == *src
+                }));
+            if exists {
+                let pair = t.pairs.get_mut(&tkey).unwrap();
+                pair.source = Some(src.clone());
+            }
+        }
+        let target_cols: std::collections::HashSet<String> = t
+            .target_table_meta(&tkey)
+            .map(|tm| tm.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let pair = t.pairs.get_mut(&tkey).unwrap();
+        let mut applied = 0usize;
+        let mut skipped = Vec::new();
+        for m in input.get("mappings").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(target) = m.get("target").and_then(|v| v.as_str()) else { continue };
+            if !target_cols.contains(target) {
+                skipped.push(target.to_string());
+                continue;
+            }
+            let expr = if let Some(s) = m.get("source").and_then(|v| v.as_str()) {
+                crate::db::datasync::SourceExpr::Column(s.to_string())
+            } else if let Some(e) = m.get("expression").and_then(|v| v.as_str()) {
+                crate::db::datasync::SourceExpr::Expr(e.to_string())
+            } else if let (Some(parent), Some(col)) = (
+                m.get("lookup").and_then(|l| l.get("parent")).and_then(|v| v.as_str()),
+                m.get("lookup").and_then(|l| l.get("column")).and_then(|v| v.as_str()),
+            ) {
+                crate::db::datasync::SourceExpr::KeyLookup {
+                    table: parent.to_string(),
+                    column: col.to_string(),
+                }
+            } else {
+                continue;
+            };
+            pair.mapping.insert(target.to_string(), expr);
+            pair.enabled_cols.insert(target.to_string());
+            applied += 1;
+        }
+        if applied > 0 {
+            pair.enabled = true;
+        }
+        if let Some(f) = input.get("filter").and_then(|v| v.as_str()) {
+            pair.filter = f.to_string();
+        }
+        t.expanded.insert(tkey.clone());
+        t.armed = false;
+        self.active_tab = Some(tab_id);
+        self.status = Some(if skipped.is_empty() {
+            format!("Applied {applied} mapping(s) to {tkey}.")
+        } else {
+            format!(
+                "Applied {applied} mapping(s) to {tkey}; skipped unknown target column(s): {}",
+                skipped.join(", ")
+            )
+        });
+    }
+
+    /// The transfer tab AI tools act on: the active one, else the only/first.
+    fn find_transfer_tab_id(&self) -> Option<TabId> {
+        if let Some(id) = self.active_tab {
+            if matches!(self.tabs.iter().find(|t| t.id() == id), Some(Tab::Transfer(_))) {
+                return Some(id);
+            }
+        }
+        self.tabs.iter().find_map(|t| match t {
+            Tab::Transfer(tr) => Some(tr.id),
+            _ => None,
+        })
+    }
+
+    /// Mirror the transfer tab into `ai_tools` for the `read_transfer` tool.
+    /// Only built while the AI panel is open — the snapshot can be sizeable
+    /// for databases with many tables.
+    fn publish_transfer_snapshot(&self) {
+        if !self.ai_panel.open {
+            crate::ai_tools::set_active_transfer(None);
+            return;
+        }
+        let tab = self.find_transfer_tab_id().and_then(|id| {
+            self.tabs.iter().find_map(|t| match t {
+                Tab::Transfer(tr) if tr.id == id => Some(tr),
+                _ => None,
+            })
+        });
+        let snap = tab.map(|t| {
+            let conn_info = |conn: Option<ConnectionId>| {
+                conn.and_then(|c| self.active.iter().find(|a| a.conn_id == c))
+                    .map(|a| {
+                        serde_json::json!({
+                            "connection": format!("{} · {}", a.name, a.database),
+                            "engine": format!("{:?}", a.kind),
+                        })
+                    })
+                    .unwrap_or_else(|| serde_json::json!({}))
+            };
+            let cols = |tm: &crate::db::TableMeta| -> serde_json::Value {
+                tm.columns
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "name": c.name,
+                            "type": c.type_name,
+                            "nullable": c.nullable,
+                            "pk": c.is_primary_key,
+                        })
+                    })
+                    .collect()
+            };
+            const PAIR_DETAIL_CAP: usize = 60;
+            let pairs: Vec<serde_json::Value> = t
+                .pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (tkey, p))| {
+                    let mut v = serde_json::json!({
+                        "target_table": tkey,
+                        "source_table": p.source,
+                        "enabled": p.enabled,
+                        "filter": p.filter,
+                    });
+                    if i < PAIR_DETAIL_CAP {
+                        if let Some(stm) = t.source_table_meta(p) {
+                            v["source_columns"] = cols(stm);
+                        }
+                        if let Some(ttm) = t.target_table_meta(tkey) {
+                            v["target_columns"] = cols(ttm);
+                        }
+                        v["new_ids"] = serde_json::json!(p.new_pk);
+                        v["mapping"] = p
+                            .mapping
+                            .iter()
+                            .map(|(target, src)| {
+                                let mut m = match src {
+                                    crate::db::datasync::SourceExpr::Column(c) => {
+                                        serde_json::json!({ "target": target, "source": c })
+                                    }
+                                    crate::db::datasync::SourceExpr::Expr(e) => {
+                                        serde_json::json!({ "target": target, "expression": e })
+                                    }
+                                    crate::db::datasync::SourceExpr::KeyLookup {
+                                        table,
+                                        column,
+                                    } => serde_json::json!({
+                                        "target": target,
+                                        "lookup": { "parent": table, "column": column },
+                                    }),
+                                };
+                                m["enabled"] =
+                                    serde_json::json!(p.enabled_cols.contains(target));
+                                m
+                            })
+                            .collect();
+                    }
+                    v
+                })
+                .collect();
+            let table_names = |meta: &Option<crate::db::DbMeta>| -> Vec<serde_json::Value> {
+                meta.as_ref()
+                    .map(|m| {
+                        m.tables
+                            .iter()
+                            .filter(|tm| matches!(tm.kind, crate::db::TableKind::Table))
+                            .take(300)
+                            .map(|tm| {
+                                serde_json::Value::String(format!("{}.{}", tm.schema, tm.name))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            serde_json::json!({
+                "source": conn_info(t.source),
+                "target": conn_info(t.target),
+                "pairs": pairs,
+                "pair_detail_cap": PAIR_DETAIL_CAP,
+                "source_tables": table_names(&t.source_meta),
+                "target_tables": table_names(&t.target_meta),
+                "row_limit": t.row_limit,
+                "delete_first": t.delete_first,
+            })
+            .to_string()
+        });
+        crate::ai_tools::set_active_transfer(snap);
     }
 
     fn disconnect_profile(&mut self, profile_id: Uuid) {
@@ -2837,6 +3145,80 @@ impl App {
         self.tabs.push(Tab::DataSync(tab));
         self.active_tab = Some(id);
         self.datasync_load_tables(id);
+    }
+
+    fn open_transfer_tab(&mut self, source: ConnectionId) {
+        let id = Uuid::new_v4();
+        let tab = crate::ui::transfer_tab::TransferTab::new(id, Some(source));
+        self.tabs.push(Tab::Transfer(tab));
+        self.active_tab = Some(id);
+        self.transfer_load_meta(id, true);
+    }
+
+    /// Introspect the transfer tab's source (or target) connection.
+    fn transfer_load_meta(&mut self, tab_id: TabId, source_side: bool) {
+        let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) else { return };
+        let conn = if source_side { t.source } else { t.target };
+        let Some(conn) = conn else { return };
+        if source_side {
+            t.source_meta_loading = true;
+        } else {
+            t.target_meta_loading = true;
+        }
+        t.error = None;
+        let pending = if source_side {
+            Pending::TransferSrcMeta(tab_id)
+        } else {
+            Pending::TransferTgtMeta(tab_id)
+        };
+        self.send(pending, move |req| Command::FetchDbMeta { req, conn });
+    }
+
+    fn transfer_run(&mut self, tab_id: TabId) {
+        let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) else { return };
+        let (Some(source), Some(target)) = (t.source, t.target) else { return };
+        let specs = t.build_specs();
+        if specs.is_empty() {
+            return;
+        }
+        let delete_first = t.delete_first;
+        // Same rail as Pull: never write into production/read-only profiles.
+        let target_profile = self.find_active_by_conn(target).map(|a| a.profile_id);
+        let blocked = target_profile.is_some_and(|pid| {
+            self.profiles
+                .iter()
+                .any(|p| p.id == pid && (p.read_only || p.production))
+        });
+        let Some(Tab::Transfer(t)) = self.find_tab_mut(tab_id) else { return };
+        if blocked {
+            t.error = Some(
+                "Refusing to transfer into a production or read-only profile — \
+                 that direction is locked out by design."
+                    .into(),
+            );
+            return;
+        }
+        t.running = true;
+        t.status = None;
+        t.error = None;
+        self.send(Pending::TransferRun(tab_id), move |req| Command::DataTransfer {
+            req,
+            source,
+            target,
+            specs,
+            delete_first,
+        });
+    }
+
+    /// Cancel the tab's in-flight transfer; the run still finishes with a
+    /// DataTransferred event reporting where it stopped.
+    fn transfer_stop(&mut self, tab_id: TabId) {
+        let req = self.pending.iter().find_map(|(r, p)| {
+            matches!(p, Pending::TransferRun(t) if *t == tab_id).then_some(*r)
+        });
+        if let Some(req) = req {
+            self.runtime.send(Command::CancelTransfer { req });
+        }
     }
 
     fn datasync_load_tables(&mut self, tab_id: TabId) {
@@ -3629,6 +4011,7 @@ impl eframe::App for App {
         self.last_input_time = ctx.input(|i| i.time);
         self.window_focused = ctx.input(|i| i.focused);
         self.publish_editor_snapshot();
+        self.publish_transfer_snapshot();
         // 1. Drain events.
         let events = self.runtime.drain_events();
         for e in events {
@@ -4070,6 +4453,33 @@ impl eframe::App for App {
                         crate::ui::datasync_tab::DataSyncAction::Pull => {
                             pending_actions.push(Box::new(move |app: &mut Self| {
                                 app.datasync_pull(tab_id);
+                            }));
+                        }
+                    }
+                }
+                Tab::Transfer(t) => {
+                    let action = crate::ui::transfer_tab::draw(ui, t, &self.active);
+                    let tab_id = t.id;
+                    match action {
+                        crate::ui::transfer_tab::TransferAction::None => {}
+                        crate::ui::transfer_tab::TransferAction::LoadSourceMeta => {
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.transfer_load_meta(tab_id, true);
+                            }));
+                        }
+                        crate::ui::transfer_tab::TransferAction::LoadTargetMeta => {
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.transfer_load_meta(tab_id, false);
+                            }));
+                        }
+                        crate::ui::transfer_tab::TransferAction::Run => {
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.transfer_run(tab_id);
+                            }));
+                        }
+                        crate::ui::transfer_tab::TransferAction::Stop => {
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.transfer_stop(tab_id);
                             }));
                         }
                     }
@@ -4784,6 +5194,9 @@ impl App {
             }
             T::DataSync(conn) => {
                 self.open_datasync_tab(conn);
+            }
+            T::TransferData(conn) => {
+                self.open_transfer_tab(conn);
             }
             T::DumpDatabase(conn) => {
                 self.open_backup_dialog(conn, false);

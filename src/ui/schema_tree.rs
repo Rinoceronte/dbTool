@@ -22,6 +22,8 @@ pub enum TreeAction {
     UsersAndRoles(ConnectionId),
     /// Open the data compare / sanitized pull tab, sourced from this conn.
     DataSync(ConnectionId),
+    /// Open the column-mapped cross-connection transfer tab.
+    TransferData(ConnectionId),
     /// Whole-database dump via the native tool (pg_dump/mysqldump/copy).
     DumpDatabase(ConnectionId),
     /// Restore a dump into this connection's database.

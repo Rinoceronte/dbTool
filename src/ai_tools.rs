@@ -18,6 +18,8 @@ pub const UPDATE_DBML: &str = "update_dbml";
 pub const FOCUS_TABLE: &str = "focus_table";
 pub const READ_EDITOR: &str = "read_editor";
 pub const PROPOSE_SQL: &str = "propose_sql";
+pub const READ_TRANSFER: &str = "read_transfer";
+pub const PROPOSE_MAPPING: &str = "propose_mapping";
 
 /// What the user's active query tab holds. Published by the UI thread each
 /// frame (same pattern as `claude_auth::CLI_PATH`) so `read_editor` can see
@@ -33,6 +35,18 @@ static ACTIVE_EDITOR: std::sync::RwLock<Option<EditorSnapshot>> = std::sync::RwL
 
 pub fn set_active_editor(snap: Option<EditorSnapshot>) {
     let mut slot = ACTIVE_EDITOR.write().unwrap();
+    if *slot != snap {
+        *slot = snap;
+    }
+}
+
+/// Pre-serialized JSON of the open transfer tab (connections, tables,
+/// columns, current mapping). Published by the UI thread like
+/// `ACTIVE_EDITOR`; read by the `read_transfer` tool.
+static ACTIVE_TRANSFER: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_active_transfer(snap: Option<String>) {
+    let mut slot = ACTIVE_TRANSFER.write().unwrap();
     if *slot != snap {
         *slot = snap;
     }
@@ -91,6 +105,11 @@ impl ToolCall {
             READ_DBML => format!("read {}", self.dbml_file().unwrap_or("?")),
             LIST_DBML => "list DBML documents".to_string(),
             READ_EDITOR => "read the active query editor".to_string(),
+            READ_TRANSFER => "read the transfer tab".to_string(),
+            // The card shows (and "Apply mapping" parses) the raw input JSON.
+            PROPOSE_MAPPING => {
+                serde_json::to_string_pretty(&self.input).unwrap_or_else(|_| "{}".into())
+            }
             FOCUS_TABLE => format!(
                 "focus diagram on `{}` in {}",
                 self.dbml_table().unwrap_or("?"),
@@ -111,9 +130,8 @@ pub enum ToolKind {
 impl ToolCall {
     pub fn kind(&self) -> ToolKind {
         match self.name.as_str() {
-            RUN_SELECT | LIST_DBML | READ_DBML | FOCUS_TABLE | READ_EDITOR | PROPOSE_SQL => {
-                ToolKind::ReadOnly
-            }
+            RUN_SELECT | LIST_DBML | READ_DBML | FOCUS_TABLE | READ_EDITOR | PROPOSE_SQL
+            | READ_TRANSFER | PROPOSE_MAPPING => ToolKind::ReadOnly,
             RUN_STATEMENT | UPDATE_DBML => ToolKind::Write,
             _ => ToolKind::Unknown,
         }
@@ -253,6 +271,68 @@ pub fn tool_defs() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: READ_TRANSFER.into(),
+            description: "Read the state of the user's open Transfer-data tab: source and \
+                          target connections (engines may differ), and one pair per TARGET \
+                          table with the source table feeding it, both sides' columns \
+                          (name, type, nullable, pk), the current column mapping, and \
+                          filter. Use this whenever the user asks for help mapping or \
+                          moving data between tables. Errors if no transfer tab is open."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        Tool {
+            name: PROPOSE_MAPPING.into(),
+            description: "Propose a column mapping for the user's open Transfer-data tab. \
+                          The mapping is displayed as a card with a one-click 'Apply \
+                          mapping' action — you cannot modify the tab directly. Each entry \
+                          maps one TARGET column from either a plain SOURCE column or a raw \
+                          SQL expression evaluated on the source per row (concatenation, \
+                          JSON building, casts — written in the SOURCE engine's dialect). \
+                          Call read_transfer first to see both tables."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["table", "mappings"],
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "SOURCE table to pull from, as \"schema.table\" (a pairs[].source_table from read_transfer). Also re-pairs the pair's source when it differs."
+                    },
+                    "target_table": {
+                        "type": "string",
+                        "description": "TARGET table pair this applies to (\"schema.table\", a pairs[].target_table). Recommended — pairs are keyed by target table."
+                    },
+                    "mappings": {
+                        "type": "array",
+                        "description": "One entry per target column to fill.",
+                        "items": {
+                            "type": "object",
+                            "required": ["target"],
+                            "properties": {
+                                "target": { "type": "string", "description": "Target column name." },
+                                "source": { "type": "string", "description": "Source column feeding it. Exactly one of source, expression, lookup." },
+                                "expression": { "type": "string", "description": "Raw SQL evaluated on the source, in the source dialect." },
+                                "lookup": {
+                                    "type": "object",
+                                    "required": ["parent", "column"],
+                                    "description": "Translate an old FK value through the new-id key map of a parent pair that has new_ids enabled.",
+                                    "properties": {
+                                        "parent": { "type": "string", "description": "Parent SOURCE table (\"schema.table\")." },
+                                        "column": { "type": "string", "description": "This table's source column holding the old key." }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional WHERE body for the source table (its dialect), e.g. \"status = 'active'\"."
+                    }
+                }
+            }),
+        },
+        Tool {
             name: FOCUS_TABLE.into(),
             description: "Pan the diagram view to a table so the user can watch where you \
                           are working. Opens the DBML document in a diagram tab if it is \
@@ -344,6 +424,41 @@ pub async fn execute(call: &ToolCall, driver: Option<&DynDriver>) -> ToolOutcome
             ToolOutcome::ok(json!({
                 "shown": true,
                 "note": "the SQL is displayed with copy / open-in-editor / replace-query actions"
+            }))
+        }
+        READ_TRANSFER => match ACTIVE_TRANSFER.read().unwrap().clone() {
+            Some(snap) => ToolOutcome { content: snap, is_error: false },
+            None => ToolOutcome::err(
+                "no transfer tab is open; ask the user to open one \
+                 (right-click a connection → Transfer data…)",
+            ),
+        },
+        PROPOSE_MAPPING => {
+            let valid = call
+                .input
+                .get("mappings")
+                .and_then(|m| m.as_array())
+                .is_some_and(|ms| {
+                    !ms.is_empty()
+                        && ms.iter().all(|m| {
+                            let feeds = [
+                                m.get("source").and_then(|s| s.as_str()).is_some(),
+                                m.get("expression").and_then(|e| e.as_str()).is_some(),
+                                m.get("lookup").is_some_and(|l| l.is_object()),
+                            ];
+                            m.get("target").and_then(|t| t.as_str()).is_some()
+                                && feeds.iter().filter(|f| **f).count() == 1
+                        })
+                });
+            if !valid {
+                return ToolOutcome::err(
+                    "'mappings' must be a non-empty array of {target, and exactly one \
+                     of source / expression / lookup}",
+                );
+            }
+            ToolOutcome::ok(json!({
+                "shown": true,
+                "note": "the mapping is displayed with an 'Apply mapping' action"
             }))
         }
         other => ToolOutcome::err(format!("unknown tool: {other}")),

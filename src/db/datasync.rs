@@ -528,8 +528,15 @@ fn checksum_sql(kind: DbKind, sel: &TableSel) -> (String, bool) {
     }
 }
 
-/// PK-ordered page of a table's rows.
-fn page_sql(kind: DbKind, sel: &TableSel, limit: usize, offset: u64) -> String {
+/// PK-ordered page of a table's rows; `filter` is a raw WHERE body in the
+/// source dialect.
+fn page_sql(
+    kind: DbKind,
+    sel: &TableSel,
+    filter: Option<&str>,
+    limit: usize,
+    offset: u64,
+) -> String {
     let cols = sel
         .columns
         .iter()
@@ -543,11 +550,18 @@ fn page_sql(kind: DbKind, sel: &TableSel, limit: usize, offset: u64) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let tbl = qtable(kind, sel);
+    let where_sql = filter
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .map(|f| format!(" WHERE {f}"))
+        .unwrap_or_default();
     match kind {
         DbKind::MsSql => format!(
-            "SELECT {cols} FROM {tbl} ORDER BY {order} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+            "SELECT {cols} FROM {tbl}{where_sql} ORDER BY {order} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
         ),
-        _ => format!("SELECT {cols} FROM {tbl} ORDER BY {order} LIMIT {limit} OFFSET {offset}"),
+        _ => format!(
+            "SELECT {cols} FROM {tbl}{where_sql} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+        ),
     }
 }
 
@@ -611,7 +625,7 @@ impl<'a> Pager<'a> {
 
     async fn peek(&mut self) -> Result<Option<&Vec<Value>>> {
         if self.buf.is_empty() && !self.done {
-            let sql = page_sql(self.kind, self.sel, PAGE_ROWS, self.offset);
+            let sql = page_sql(self.kind, self.sel, None, PAGE_ROWS, self.offset);
             let rs = self.driver.query(&sql).await?;
             self.offset += rs.rows.len() as u64;
             if rs.rows.len() < PAGE_ROWS {
@@ -886,7 +900,7 @@ pub async fn pull_table(
     let mut written: u64 = 0;
     let mut offset: u64 = 0;
     loop {
-        let page = page_sql(source.kind(), &order_sel, PAGE_ROWS, offset);
+        let page = page_sql(source.kind(), &order_sel, None, PAGE_ROWS, offset);
         let rs = source.query(&page).await?;
         let n = rs.rows.len();
         offset += n as u64;
@@ -934,6 +948,404 @@ pub async fn pull_table(
                 schema = sel.schema.replace('\'', "''"),
                 table = sel.table.replace('\'', "''"),
                 pk_e = pk.replace('\'', "''"),
+            );
+            let _ = target.query(&seq_sql).await;
+        }
+    }
+    Ok(written)
+}
+
+/// What feeds one target column of a transfer: a plain source column, a raw
+/// SQL expression evaluated on the source (concat, JSON building, …), or a
+/// key-map lookup that translates an old foreign-key value into the id newly
+/// generated for the parent row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceExpr {
+    Column(String),
+    Expr(String),
+    /// Read source column `column` and replace its value through the key map
+    /// captured for the parent pair whose source table is `table`
+    /// ("schema.table").
+    KeyLookup { table: String, column: String },
+}
+
+impl SourceExpr {
+    fn select_sql(&self, kind: DbKind) -> String {
+        match self {
+            SourceExpr::Column(c) => quote_ident(kind, c),
+            SourceExpr::Expr(e) => format!("({})", e.trim()),
+            SourceExpr::KeyLookup { column, .. } => quote_ident(kind, column),
+        }
+    }
+}
+
+/// Old→new id maps captured during a multi-table transfer, keyed by the
+/// parent pair's source table ("schema.table"). Old keys are normalized to
+/// their display string.
+pub type KeyMaps = std::collections::HashMap<String, std::collections::HashMap<String, Value>>;
+
+/// Generate the target PK instead of copying it, capturing old→new ids.
+#[derive(Debug, Clone)]
+pub struct KeyCapture {
+    /// Source column holding the old key (e.g. `CustomerID`).
+    pub source_column: String,
+    /// The target's generated primary-key column (e.g. `id`).
+    pub target_pk: String,
+}
+
+/// A cross-connection, column-mapped copy: which source columns/expressions
+/// feed which target columns. Connections may be different engines — paging
+/// runs in the source dialect, INSERT literals render in the target dialect.
+#[derive(Debug, Clone)]
+pub struct TransferSpec {
+    pub source_schema: String,
+    pub source_table: String,
+    pub target_schema: String,
+    pub target_table: String,
+    /// (source column/expression, target column), in insert order.
+    pub columns: Vec<(SourceExpr, String)>,
+    /// Source-side ORDER BY key for stable paging (source PK when known).
+    pub order_by: Vec<String>,
+    /// Raw WHERE body in the source dialect (no keyword), if any.
+    pub filter: Option<String>,
+    pub row_limit: Option<u64>,
+    /// DELETE the target table's rows before inserting (default appends).
+    pub delete_first: bool,
+    /// When set, the target generates its PK and old→new ids are captured
+    /// into [`KeyMaps`] for children's `KeyLookup` mappings.
+    pub key_capture: Option<KeyCapture>,
+}
+
+/// Copy mapped columns from one table to another across connections.
+/// Crude window-function sniff: the keyword `OVER` followed by `(`. Quoted
+/// identifiers can false-positive; that only costs OFFSET-paging speed,
+/// never correctness.
+fn contains_window_fn(expr: &str) -> bool {
+    let l = expr.to_ascii_lowercase();
+    let b = l.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = l[from..].find("over").map(|p| p + from) {
+        let boundary_before = pos == 0 || {
+            let c = b[pos - 1] as char;
+            !c.is_alphanumeric() && c != '_'
+        };
+        if boundary_before && l[pos + 4..].trim_start().starts_with('(') {
+            return true;
+        }
+        from = pos + 4;
+    }
+    false
+}
+
+/// `key_maps` accumulates old→new ids for [`KeyCapture`] pairs and resolves
+/// [`SourceExpr::KeyLookup`] mappings; pass one map across an ordered run.
+pub async fn transfer_table(
+    source: &DynDriver,
+    target: &DynDriver,
+    spec: &TransferSpec,
+    masks: &MaskMap,
+    key_maps: &mut KeyMaps,
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: &(impl Fn(String) + Sync),
+) -> Result<u64> {
+    anyhow::ensure!(!spec.columns.is_empty(), "no columns mapped");
+    let (skind, tkind) = (source.kind(), target.kind());
+    // Mask keys use the plain source column name; expressions key by the
+    // target name (the only stable identity they have).
+    let mask_sel = TableSel {
+        schema: spec.source_schema.clone(),
+        table: spec.source_table.clone(),
+        columns: spec
+            .columns
+            .iter()
+            .map(|(s, t)| match s {
+                SourceExpr::Column(c) | SourceExpr::KeyLookup { column: c, .. } => c.clone(),
+                SourceExpr::Expr(_) => t.clone(),
+            })
+            .collect(),
+        pk: Vec::new(),
+    };
+    let stbl = qtable(skind, &mask_sel);
+    // Column positions that translate through a parent's key map.
+    let lookups: Vec<(usize, &str)> = spec
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (s, _))| match s {
+            SourceExpr::KeyLookup { table, .. } => Some((i, table.as_str())),
+            _ => None,
+        })
+        .collect();
+    for (_, parent) in &lookups {
+        anyhow::ensure!(
+            key_maps.contains_key(*parent),
+            "key lookup needs {parent} transferred first with \"new ids\" enabled"
+        );
+    }
+    let source_key = format!("{}.{}", spec.source_schema, spec.source_table);
+    if spec.key_capture.is_some() {
+        // Present even if the table is empty, so children with all-NULL FKs
+        // don't fail the "parent transferred?" precheck.
+        key_maps.entry(source_key.clone()).or_default();
+    }
+    let target_sel = TableSel {
+        schema: spec.target_schema.clone(),
+        table: spec.target_table.clone(),
+        columns: spec.columns.iter().map(|(_, t)| t.clone()).collect(),
+        pk: Vec::new(),
+    };
+    let ttbl = qtable(tkind, &target_sel);
+    if spec.delete_first {
+        target.query(&format!("DELETE FROM {ttbl}")).await?;
+    }
+    // With key capture the old key rides along as an extra trailing column;
+    // a single-column paging order rides along too, for keyset paging.
+    let mut select_items: Vec<String> =
+        spec.columns.iter().map(|(s, _)| s.select_sql(skind)).collect();
+    if let Some(kc) = &spec.key_capture {
+        select_items.push(quote_ident(skind, &kc.source_column));
+    }
+    // Window functions see only the WHERE-filtered set, so a keyset
+    // predicate would change their result per page (e.g. ROW_NUMBER
+    // restarting) — those tables page by OFFSET, where the window always
+    // spans the whole table.
+    let windowed = spec
+        .columns
+        .iter()
+        .any(|(s, _)| matches!(s, SourceExpr::Expr(e) if contains_window_fn(e)));
+    let keyset_col: Option<String> = match spec.order_by.as_slice() {
+        [one] if !windowed => Some(one.clone()),
+        _ => None,
+    };
+    if let Some(c) = &keyset_col {
+        select_items.push(quote_ident(skind, c));
+    }
+    let select_list = select_items.join(", ");
+    // Stable paging order: source PK, else the first select item by ordinal.
+    // Table-qualified so it binds to the input column even when the same
+    // column also appears in the select list (capture/keyset duplicates
+    // would otherwise make `ORDER BY col` ambiguous).
+    let src_tbl_q = quote_ident(skind, &spec.source_table);
+    let order = if spec.order_by.is_empty() {
+        "1".to_owned()
+    } else {
+        spec.order_by
+            .iter()
+            .map(|c| format!("{src_tbl_q}.{}", quote_ident(skind, c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let where_sql = spec
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|f| format!(" WHERE {f}"))
+        .unwrap_or_default();
+    let tcols = target_sel
+        .columns
+        .iter()
+        .map(|c| quote_ident(tkind, c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut written: u64 = 0;
+    let mut offset: u64 = 0;
+    // Keyset paging (WHERE pk > last-seen) stays O(1) per page where OFFSET
+    // re-skips every prior row; falls back to OFFSET on NULL keys.
+    let mut keyset_active = keyset_col.is_some();
+    let mut last_key: Option<Value> = None;
+    let ncols = spec.columns.len();
+    let key_idx = ncols + usize::from(spec.key_capture.is_some());
+    loop {
+        anyhow::ensure!(
+            !cancel.is_cancelled(),
+            "stopped by user after {written} row(s) — copied rows stay in the target"
+        );
+        let page = if keyset_active {
+            let kq = format!(
+                "{src_tbl_q}.{}",
+                quote_ident(skind, keyset_col.as_deref().unwrap_or_default())
+            );
+            let mut conds: Vec<String> = Vec::new();
+            if let Some(f) = spec.filter.as_deref().map(str::trim).filter(|f| !f.is_empty())
+            {
+                conds.push(format!("({f})"));
+            }
+            if let Some(v) = &last_key {
+                conds.push(format!("{kq} > {}", value_literal(skind, v)));
+            }
+            let where_clause = if conds.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conds.join(" AND "))
+            };
+            match skind {
+                DbKind::MsSql => format!(
+                    "SELECT TOP {PAGE_ROWS} {select_list} FROM {stbl}{where_clause} \
+                     ORDER BY {kq}"
+                ),
+                _ => format!(
+                    "SELECT {select_list} FROM {stbl}{where_clause} ORDER BY {kq} \
+                     LIMIT {PAGE_ROWS}"
+                ),
+            }
+        } else {
+            match skind {
+                DbKind::MsSql => format!(
+                    "SELECT {select_list} FROM {stbl}{where_sql} ORDER BY {order} \
+                     OFFSET {offset} ROWS FETCH NEXT {PAGE_ROWS} ROWS ONLY"
+                ),
+                _ => format!(
+                    "SELECT {select_list} FROM {stbl}{where_sql} ORDER BY {order} \
+                     LIMIT {PAGE_ROWS} OFFSET {offset}"
+                ),
+            }
+        };
+        let rs = source.query(&page).await?;
+        let n = rs.rows.len();
+        offset += n as u64;
+        let mut rows = rs.rows;
+        if keyset_active {
+            match rows.last().and_then(|r| r.get(key_idx)) {
+                Some(v) if !matches!(v, Value::Null) => last_key = Some(v.clone()),
+                // NULL / missing key: can't seek past it — OFFSET from here.
+                _ => keyset_active = false,
+            }
+        }
+        if let Some(limit) = spec.row_limit {
+            if written + rows.len() as u64 > limit {
+                rows.truncate((limit - written) as usize);
+            }
+        }
+        // Batched RETURNING follows VALUES order on Postgres; other engines
+        // give no order guarantee, so key capture there goes row-at-a-time.
+        let batch = match (&spec.key_capture, tkind) {
+            (Some(_), DbKind::Postgres) | (None, _) => INSERT_BATCH,
+            (Some(_), _) => 1,
+        };
+        for chunk in rows.chunks(batch) {
+            let mut values = Vec::with_capacity(chunk.len());
+            let mut old_keys = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let mut masked: Vec<Value> = row.get(..ncols).unwrap_or(row).to_vec();
+                if spec.key_capture.is_some() {
+                    old_keys.push(row.get(ncols).cloned().unwrap_or(Value::Null));
+                }
+                for (i, parent) in &lookups {
+                    let old = &masked[*i];
+                    if matches!(old, Value::Null) {
+                        continue;
+                    }
+                    match key_maps.get(*parent).and_then(|m| m.get(&old.display())) {
+                        Some(new_id) => masked[*i] = new_id.clone(),
+                        None => anyhow::bail!(
+                            "{source_key}: no new id for {} = {} in the key map of \
+                             {parent} — was that parent row filtered out?",
+                            spec.columns[*i].1,
+                            old.display()
+                        ),
+                    }
+                }
+                mask_row(&mask_sel, masks, &mut masked);
+                values.push(format!(
+                    "({})",
+                    masked
+                        .iter()
+                        .map(|v| value_literal(tkind, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if values.is_empty() {
+                continue;
+            }
+            match &spec.key_capture {
+                None => {
+                    let sql =
+                        format!("INSERT INTO {ttbl} ({tcols}) VALUES {}", values.join(", "));
+                    target.query(&sql).await?;
+                }
+                Some(kc) => {
+                    let pk = quote_ident(tkind, &kc.target_pk);
+                    let first_col = |rs: crate::db::ResultSet| -> Vec<Value> {
+                        rs.rows
+                            .into_iter()
+                            .filter_map(|mut r| (!r.is_empty()).then(|| r.remove(0)))
+                            .collect()
+                    };
+                    // Phrased so each driver's keyword classifier takes its
+                    // row-returning path — a statement led by INSERT is
+                    // execute()d and its result rows dropped.
+                    let new_ids: Vec<Value> = match tkind {
+                        DbKind::Postgres => {
+                            let sql = format!(
+                                "WITH ins AS (INSERT INTO {ttbl} ({tcols}) VALUES {} \
+                                 RETURNING {pk}) SELECT {pk} FROM ins",
+                                values.join(", ")
+                            );
+                            first_col(target.query(&sql).await?)
+                        }
+                        DbKind::MsSql => {
+                            // The SET makes this a script; scripts run whole
+                            // via simple_query, which surfaces OUTPUT rows.
+                            let sql = format!(
+                                "SET NOCOUNT ON; INSERT INTO {ttbl} ({tcols}) \
+                                 OUTPUT INSERTED.{pk} VALUES {}",
+                                values.join(", ")
+                            );
+                            first_col(target.query(&sql).await?)
+                        }
+                        DbKind::MySql | DbKind::Sqlite => {
+                            // One script = one session, so the id call can't
+                            // land on a different pooled connection.
+                            let id_fn = if tkind == DbKind::MySql {
+                                "LAST_INSERT_ID()"
+                            } else {
+                                "last_insert_rowid()"
+                            };
+                            let sql = format!(
+                                "INSERT INTO {ttbl} ({tcols}) VALUES {};\nSELECT {id_fn}",
+                                values.join(", ")
+                            );
+                            first_col(target.query(&sql).await?)
+                        }
+                    };
+                    anyhow::ensure!(
+                        new_ids.len() == old_keys.len(),
+                        "captured {} generated id(s) for {} inserted row(s)",
+                        new_ids.len(),
+                        old_keys.len()
+                    );
+                    let map = key_maps.entry(source_key.clone()).or_default();
+                    for (old, new) in old_keys.iter().zip(new_ids) {
+                        map.insert(old.display(), new);
+                    }
+                }
+            }
+            written += chunk.len() as u64;
+        }
+        progress(format!(
+            "{} → {}: {written} row(s)",
+            mask_sel.key(),
+            target_sel.key()
+        ));
+        if n < PAGE_ROWS || spec.row_limit.is_some_and(|l| written >= l) {
+            break;
+        }
+    }
+
+    // Postgres target: bump serial sequences past any copied ids (no-op and
+    // ignored for columns without a sequence).
+    if tkind == DbKind::Postgres {
+        for col in &target_sel.columns {
+            let seq_sql = format!(
+                "SELECT setval(s::regclass, GREATEST((SELECT COALESCE(MAX({col_q}), 1) FROM {ttbl}), 1)) \
+                 FROM pg_get_serial_sequence('{schema}.{table}', '{col_e}') s WHERE s IS NOT NULL",
+                col_q = quote_ident(tkind, col),
+                schema = spec.target_schema.replace('\'', "''"),
+                table = spec.target_table.replace('\'', "''"),
+                col_e = col.replace('\'', "''"),
             );
             let _ = target.query(&seq_sql).await;
         }
@@ -1022,6 +1434,16 @@ pub fn save_config(profile_id: uuid::Uuid, config: &SavedSyncConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_fn_sniff() {
+        assert!(contains_window_fn("ROW_NUMBER() OVER (PARTITION BY Email)"));
+        assert!(contains_window_fn("count(*) over(order by id)"));
+        assert!(contains_window_fn("LOWER(CASE WHEN ROW_NUMBER() OVER (PARTITION BY e) = 1 THEN e END)"));
+        assert!(!contains_window_fn("CONCAT(FirstName, ' ', LastName)"));
+        assert!(!contains_window_fn("rollover + 1"));
+        assert!(!contains_window_fn("turnover_rate * 2"));
+    }
 
     #[test]
     fn fake_masks_are_deterministic_and_shaped() {

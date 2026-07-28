@@ -376,6 +376,17 @@ fn draw_conn_row(
                 *tree_action = TreeAction::DataSync(conn);
                 ui.close_menu();
             }
+            if ui
+                .button("Transfer data…")
+                .on_hover_text(
+                    "Column-mapped copy of one table into another — any \
+                     connection, engines and names may differ",
+                )
+                .clicked()
+            {
+                *tree_action = TreeAction::TransferData(conn);
+                ui.close_menu();
+            }
             compare_menu_items(ui, &mut state.compare_selection, conn, tree_action);
             if profile.kind != DbKind::MySql
                 && !profile.kind.is_file_based()

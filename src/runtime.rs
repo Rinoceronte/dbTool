@@ -116,6 +116,19 @@ pub enum Command {
         masks: crate::db::datasync::MaskMap,
         row_limit: Option<u64>,
     },
+    /// Column-mapped copy of tables across connections (engines may differ).
+    /// Specs arrive in FK-safe insert order (parents first).
+    DataTransfer {
+        req: RequestId,
+        source: ConnectionId,
+        target: ConnectionId,
+        specs: Vec<crate::db::datasync::TransferSpec>,
+        /// Clear every included target table (children first) before inserting.
+        delete_first: bool,
+    },
+    /// Stop a running DataTransfer after its current batch; rows already
+    /// copied stay in the target.
+    CancelTransfer { req: RequestId },
     /// Whole-database dump via the engine's native tool (pg_dump/mysqldump;
     /// SQLite = file copy). Tunnelled profiles get a fresh tunnel.
     DumpDatabase { req: RequestId, conn: ConnectionId, path: String },
@@ -211,6 +224,12 @@ pub enum Event {
         reports: Vec<crate::db::datasync::TableReport>,
     },
     DataPulled {
+        req: RequestId,
+        tables: usize,
+        rows: u64,
+        errors: Vec<String>,
+    },
+    DataTransferred {
         req: RequestId,
         tables: usize,
         rows: u64,
@@ -315,11 +334,29 @@ async fn worker_main(
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            Command::CancelQuery { req } => {
+            Command::CancelQuery { req } | Command::CancelTransfer { req } => {
                 if let Some(t) = cancels.write().await.remove(&req) {
                     t.cancel();
-                    // The query task reports "Query cancelled" itself.
+                    // The query/transfer task reports its own cancellation.
                 }
+                continue;
+            }
+            // Intercepted here (not handle_command) to wire a cancel token.
+            Command::DataTransfer { req, source, target, specs, delete_first } => {
+                let token = CancellationToken::new();
+                cancels.write().await.insert(req, token.clone());
+                let evt_tx = evt_tx.clone();
+                let ctx = ctx.clone();
+                let connections = connections.clone();
+                let cancels = cancels.clone();
+                tokio::spawn(async move {
+                    run_transfer(
+                        req, source, target, specs, delete_first, &connections, &token,
+                        &evt_tx, &ctx,
+                    )
+                    .await;
+                    cancels.write().await.remove(&req);
+                });
                 continue;
             }
             Command::Query { req, conn, sql, unlimited } => {
@@ -364,6 +401,73 @@ async fn worker_main(
 fn send(evt_tx: &mpsc::UnboundedSender<Event>, ctx: &egui::Context, event: Event) {
     let _ = evt_tx.send(event);
     ctx.request_repaint();
+}
+
+/// A DataTransfer run: bulk clears, then each spec in FK-safe order, sharing
+/// one key map. Stops between batches when `cancel` fires; copied rows stay.
+#[allow(clippy::too_many_arguments)]
+async fn run_transfer(
+    req: RequestId,
+    source: ConnectionId,
+    target: ConnectionId,
+    specs: Vec<crate::db::datasync::TransferSpec>,
+    delete_first: bool,
+    connections: &Connections,
+    cancel: &CancellationToken,
+    evt_tx: &mpsc::UnboundedSender<Event>,
+    ctx: &egui::Context,
+) {
+    let (Some(src), Some(tgt)) = (
+        get_driver(connections, source).await,
+        get_driver(connections, target).await,
+    ) else {
+        return send(evt_tx, ctx, Event::Error { req, error: "connection not found".into() });
+    };
+    let mut rows = 0u64;
+    let mut done = 0usize;
+    let mut errors = Vec::new();
+    if delete_first {
+        // Children first (specs are parents-first insert order).
+        for spec in specs.iter().rev() {
+            let tbl = format!(
+                "{}.{}",
+                crate::db::quote_ident(tgt.kind(), &spec.target_schema),
+                crate::db::quote_ident(tgt.kind(), &spec.target_table)
+            );
+            if let Err(e) = tgt.query(&format!("DELETE FROM {tbl}")).await {
+                errors.push(format!(
+                    "{}.{}: clear failed: {e:#}",
+                    spec.target_schema, spec.target_table
+                ));
+            }
+        }
+    }
+    let mut key_maps = crate::db::datasync::KeyMaps::default();
+    for spec in &specs {
+        if cancel.is_cancelled() {
+            errors.push("stopped by user — remaining tables skipped".into());
+            break;
+        }
+        let progress = |message: String| {
+            send(evt_tx, ctx, Event::DataProgress { req, message });
+        };
+        let masks = crate::db::datasync::MaskMap::new();
+        match crate::db::datasync::transfer_table(
+            &src, &tgt, spec, &masks, &mut key_maps, cancel, &progress,
+        )
+        .await
+        {
+            Ok(n) => {
+                rows += n;
+                done += 1;
+            }
+            Err(e) => errors.push(format!(
+                "{}.{}: {e:#}",
+                spec.source_schema, spec.source_table
+            )),
+        }
+    }
+    send(evt_tx, ctx, Event::DataTransferred { req, tables: done, rows, errors });
 }
 
 /// Ping every minute; on failure, rebuild the connection (and tunnel) IN
@@ -527,6 +631,10 @@ async fn handle_command(
             }
             send(&evt_tx, &ctx, Event::DataPulled { req, tables: done, rows, errors });
         }
+
+        // DataTransfer/CancelTransfer are intercepted in worker_main so a
+        // cancel token can be registered; they never reach here.
+        Command::DataTransfer { .. } | Command::CancelTransfer { .. } => {}
 
         Command::ListSchemas { req, conn } => {
             let Some(driver) = get_driver(&connections, conn).await else {
