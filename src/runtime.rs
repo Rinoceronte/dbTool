@@ -155,8 +155,9 @@ pub enum Command {
     AuthStatus { req: RequestId },
     AuthLogin { req: RequestId, use_console: bool },
     AuthLogout { req: RequestId },
-    /// Ask GitHub for the latest release (startup, fire-and-forget).
-    CheckForUpdate,
+    /// Ask GitHub for the latest release. Manual checks (from Settings) get
+    /// explicit "up to date" / failure events; the startup check stays silent.
+    CheckForUpdate { manual: bool },
     /// Download the Windows installer and run it silently.
     ApplyUpdate { url: String, version: String },
 }
@@ -244,6 +245,10 @@ pub enum Event {
     AiSessionEnded { session: SessionId },
     /// A newer release exists on GitHub.
     UpdateAvailable { info: crate::update::UpdateInfo },
+    /// A manual check found no newer release.
+    UpdateUpToDate,
+    /// A manual check failed (offline, rate limit, …).
+    UpdateCheckFailed { error: String },
     /// The Windows installer was downloaded and launched; the app should exit
     /// so the installer can replace it (it relaunches dbTool when done).
     UpdateInstallerLaunched,
@@ -843,9 +848,13 @@ async fn handle_command(
             Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
         },
 
-        Command::CheckForUpdate => match crate::update::check().await {
+        Command::CheckForUpdate { manual } => match crate::update::check().await {
             Ok(Some(info)) => send(&evt_tx, &ctx, Event::UpdateAvailable { info }),
+            Ok(None) if manual => send(&evt_tx, &ctx, Event::UpdateUpToDate),
             Ok(None) => {}
+            Err(e) if manual => {
+                send(&evt_tx, &ctx, Event::UpdateCheckFailed { error: format!("{e:#}") })
+            }
             // Startup check stays silent on failure (offline, rate limit, …).
             Err(e) => log::warn!("update check failed: {e:#}"),
         },

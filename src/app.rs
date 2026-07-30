@@ -93,6 +93,8 @@ pub struct App {
     /// A newer GitHub release, surfaced as a top-bar banner.
     update_banner: Option<crate::update::UpdateInfo>,
     update_downloading: bool,
+    /// Inline feedback for manual update checks in the Settings dialog.
+    update_ui: crate::ui::settings_dialog::UpdateUi,
     /// The update installer is running; close the window so it can replace us.
     quit_for_update: bool,
     test_probe_conn: Option<ConnectionId>,
@@ -240,6 +242,7 @@ impl App {
             status: None,
             update_banner: None,
             update_downloading: false,
+            update_ui: Default::default(),
             quit_for_update: false,
             test_probe_conn: None,
             ai_panel: AiPanelState::default(),
@@ -296,7 +299,7 @@ impl App {
         }
         // Probe Claude auth status at startup so the panel populates lazily.
         app.send(Pending::AuthStatus, |req| Command::AuthStatus { req });
-        app.runtime.send(Command::CheckForUpdate);
+        app.runtime.send(Command::CheckForUpdate { manual: false });
         app
     }
 
@@ -954,6 +957,15 @@ impl App {
             }
             Event::UpdateAvailable { info } => {
                 self.update_banner = Some(info);
+                self.update_ui = Default::default();
+            }
+            Event::UpdateUpToDate => {
+                self.update_ui = Default::default();
+                self.update_ui.up_to_date = true;
+            }
+            Event::UpdateCheckFailed { error } => {
+                self.update_ui = Default::default();
+                self.update_ui.error = Some(error);
             }
             Event::UpdateInstallerLaunched => {
                 self.quit_for_update = true;
@@ -4222,13 +4234,27 @@ impl eframe::App for App {
         let ai_action = crate::ui::ai_panel::draw(ctx, &mut self.ai_panel, &self.active);
         pending_actions.push(Box::new(move |app: &mut Self| app.handle_ai_action(ai_action)));
 
-        // Settings window (theme, editor toggles, Claude account).
-        let (settings_changed, auth_action) = crate::ui::settings_dialog::draw(
+        // Settings window (theme, editor toggles, updates, Claude account).
+        let (settings_changed, auth_action, update_action) = crate::ui::settings_dialog::draw(
             ctx,
             &mut self.settings_open,
             &mut self.settings,
             &mut self.auth,
+            &self.update_ui,
+            self.update_banner.as_ref(),
+            self.update_downloading,
         );
+        match update_action {
+            crate::ui::settings_dialog::UpdateAction::None => {}
+            crate::ui::settings_dialog::UpdateAction::Check => {
+                self.update_ui.begin();
+                self.runtime.send(Command::CheckForUpdate { manual: true });
+            }
+            crate::ui::settings_dialog::UpdateAction::Install { url, version } => {
+                self.update_downloading = true;
+                self.runtime.send(Command::ApplyUpdate { url, version });
+            }
+        }
         if settings_changed {
             theme::install(ctx, self.settings.theme);
             crate::db::set_result_row_cap(self.settings.max_result_rows);
