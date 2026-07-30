@@ -127,9 +127,10 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
           APP=dbTool.app
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp dbtool-universal "$APP/Contents/MacOS/dbTool"
           chmod +x "$APP/Contents/MacOS/dbTool"
+          iconutil -c icns assets/icon.iconset -o "$APP/Contents/Resources/dbTool.icns"
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -140,6 +141,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.rinoceronte.dbtool</string>
             <key>CFBundleExecutable</key><string>dbTool</string>
             <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>dbTool</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
             <key>NSHighResolutionCapable</key><true/>

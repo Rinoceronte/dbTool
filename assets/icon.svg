@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- dbTool app icon: a database cylinder taken apart — three discs, the middle
+       one slid out and lit red (data in motion / sync). Raster renders are
+       generated procedurally; keep render_icon geometry in sync with this file. -->
+  <rect width="256" height="256" rx="56" fill="#1c1a22"/>
+  <ellipse cx="118" cy="84" rx="62" ry="23" fill="#f2efea"/>
+  <ellipse cx="142" cy="132" rx="62" ry="23" fill="#e4574c"/>
+  <ellipse cx="118" cy="180" rx="62" ry="23" fill="#f2efea"/>
+</svg>

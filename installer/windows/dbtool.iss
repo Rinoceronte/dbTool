@@ -22,6 +22,7 @@ Compression=lzma2
 SolidCompression=yes
 ChangesEnvironment=yes
 UninstallDisplayIcon={app}\dbTool.exe
+SetupIconFile=..\..\assets\icon.ico
 
 [Files]
 Source: "..\..\target\release\dbtool.exe"; DestDir: "{app}"; DestName: "dbTool.exe"; Flags: ignoreversion

@@ -11,7 +11,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_title("dbTool"),
+            .with_title("dbTool")
+            .with_icon(egui::IconData {
+                rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
 
