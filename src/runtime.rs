@@ -155,6 +155,12 @@ pub enum Command {
     AuthStatus { req: RequestId },
     AuthLogin { req: RequestId, use_console: bool },
     AuthLogout { req: RequestId },
+    /// Start a manual transaction for a query tab on a dedicated connection.
+    TxBegin { req: RequestId, conn: ConnectionId, tab: uuid::Uuid },
+    /// Run editor SQL inside the tab's open transaction.
+    TxQuery { req: RequestId, tab: uuid::Uuid, sql: String, unlimited: bool },
+    /// Commit (true) or roll back (false) the tab's transaction.
+    TxEnd { req: RequestId, tab: uuid::Uuid, commit: bool },
     /// Ask GitHub for the latest release. Manual checks (from Settings) get
     /// explicit "up to date" / failure events; the startup check stays silent.
     CheckForUpdate { manual: bool },
@@ -243,6 +249,10 @@ pub enum Event {
     Ai { session: SessionId, event: SessionEvent },
     /// The session task ended (any reason). Emitted after the final SessionEvent.
     AiSessionEnded { session: SessionId },
+    /// A manual transaction is open; the tab's next runs go through it.
+    TxStarted { req: RequestId },
+    /// The tab's transaction ended (committed or rolled back).
+    TxEnded { req: RequestId, committed: bool },
     /// A newer release exists on GitHub.
     UpdateAvailable { info: crate::update::UpdateInfo },
     /// A manual check found no newer release.
@@ -320,6 +330,11 @@ type Sessions = Arc<RwLock<HashMap<SessionId, SessionHandle>>>;
 /// KILL QUERY) before the task returns.
 type QueryCancels = Arc<RwLock<HashMap<RequestId, CancellationToken>>>;
 
+/// Open manual transactions, keyed by the owning query tab. A session is
+/// TAKEN out of the map while one of its statements runs (so a tab can never
+/// run two statements on the same session concurrently) and put back after.
+type TxSessions = Arc<tokio::sync::Mutex<HashMap<uuid::Uuid, Box<dyn crate::db::TxSession>>>>;
+
 async fn worker_main(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     evt_tx: mpsc::UnboundedSender<Event>,
@@ -328,6 +343,7 @@ async fn worker_main(
     let connections: Connections = Arc::new(RwLock::new(HashMap::new()));
     let sessions: Sessions = Arc::new(RwLock::new(HashMap::new()));
     let cancels: QueryCancels = Arc::new(RwLock::new(HashMap::new()));
+    let tx_sessions: TxSessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mcp = match McpServer::spawn().await {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -361,6 +377,83 @@ async fn worker_main(
                     )
                     .await;
                     cancels.write().await.remove(&req);
+                });
+                continue;
+            }
+            Command::TxBegin { req, conn, tab } => {
+                let evt_tx = evt_tx.clone();
+                let ctx = ctx.clone();
+                let connections = connections.clone();
+                let tx_sessions = tx_sessions.clone();
+                tokio::spawn(async move {
+                    let Some(driver) = get_driver(&connections, conn).await else {
+                        return send(
+                            &evt_tx,
+                            &ctx,
+                            Event::Error { req, error: "connection not found".into() },
+                        );
+                    };
+                    match driver.begin_tx().await {
+                        Ok(session) => {
+                            // A leftover session for this tab (shouldn't happen)
+                            // is dropped, which closes its connection.
+                            tx_sessions.lock().await.insert(tab, session);
+                            send(&evt_tx, &ctx, Event::TxStarted { req });
+                        }
+                        Err(e) => {
+                            send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") })
+                        }
+                    }
+                });
+                continue;
+            }
+            Command::TxQuery { req, tab, sql, unlimited } => {
+                let token = CancellationToken::new();
+                cancels.write().await.insert(req, token.clone());
+                let evt_tx = evt_tx.clone();
+                let ctx = ctx.clone();
+                let cancels = cancels.clone();
+                let tx_sessions = tx_sessions.clone();
+                let cap_override = unlimited.then_some(usize::MAX);
+                tokio::spawn(crate::db::RESULT_CAP_OVERRIDE.scope(cap_override, async move {
+                    let Some(mut session) = tx_sessions.lock().await.remove(&tab) else {
+                        cancels.write().await.remove(&req);
+                        return send(
+                            &evt_tx,
+                            &ctx,
+                            Event::Error { req, error: "no open transaction".into() },
+                        );
+                    };
+                    let result = session.query_script(&sql, token).await;
+                    tx_sessions.lock().await.insert(tab, session);
+                    cancels.write().await.remove(&req);
+                    match result {
+                        Ok(results) => send(&evt_tx, &ctx, Event::QueryResult { req, results }),
+                        Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+                    }
+                }));
+                continue;
+            }
+            Command::TxEnd { req, tab, commit } => {
+                let evt_tx = evt_tx.clone();
+                let ctx = ctx.clone();
+                let tx_sessions = tx_sessions.clone();
+                tokio::spawn(async move {
+                    let Some(mut session) = tx_sessions.lock().await.remove(&tab) else {
+                        return send(
+                            &evt_tx,
+                            &ctx,
+                            Event::Error { req, error: "no open transaction".into() },
+                        );
+                    };
+                    let result = if commit { session.commit().await } else { session.rollback().await };
+                    drop(session);
+                    match result {
+                        Ok(()) => send(&evt_tx, &ctx, Event::TxEnded { req, committed: commit }),
+                        // The session is gone either way (its connection is
+                        // closed on drop, so the server rolls back).
+                        Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+                    }
                 });
                 continue;
             }
@@ -533,6 +626,9 @@ async fn handle_command(
     ctx: egui::Context,
 ) {
     match cmd {
+        Command::TxBegin { .. } | Command::TxQuery { .. } | Command::TxEnd { .. } => {
+            unreachable!("transaction commands are intercepted in worker_main")
+        }
         Command::Connect { req, params } => match db::connect(&params).await {
             Ok((driver, tunnel)) => {
                 let id = ConnectionId::new_v4();

@@ -14,6 +14,74 @@ pub enum GridAction {
     CommitCell { row: usize, col: usize, text: String },
     /// Editable grids: DELETE this row (by its PK values).
     DeleteRow { row: usize },
+    /// Open the find-in-results bar (query tabs only; ignored elsewhere).
+    OpenFind,
+}
+
+/// Find-in-results state for one frame of grid drawing.
+pub struct GridFind {
+    /// Lowercased needle; empty disables highlighting.
+    pub query_lower: String,
+    /// (row, col) of the current match, tinted stronger than the rest.
+    pub current: Option<(usize, usize)>,
+    /// Scroll this row into view — set only on navigation frames so the
+    /// user keeps free scroll the rest of the time.
+    pub scroll_to_row: Option<usize>,
+}
+
+/// Case-insensitive substring test against the value's display text.
+pub fn cell_matches(v: &Value, query_lower: &str) -> bool {
+    !matches!(v, Value::Null) && v.display().to_lowercase().contains(query_lower)
+}
+
+/// How many bytes of a binary value the hex dump renders.
+const HEX_DUMP_CAP: usize = 64 * 1024;
+
+/// Full-value text for the cell viewer: binary becomes a hex dump, JSON is
+/// pretty-printed up front, everything else is the display text.
+fn viewer_content(v: &Value) -> String {
+    match v {
+        Value::Bytes(b) => hex_dump(b),
+        Value::Json(j) => {
+            serde_json::to_string_pretty(j).unwrap_or_else(|_| j.to_string())
+        }
+        other => other.display(),
+    }
+}
+
+/// Classic offset · hex · ASCII dump, 16 bytes per line.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let shown = &bytes[..bytes.len().min(HEX_DUMP_CAP)];
+    let mut out = String::with_capacity(shown.len() * 4);
+    for (li, chunk) in shown.chunks(16).enumerate() {
+        let _ = write!(out, "{:08x}  ", li * 16);
+        for i in 0..16 {
+            match chunk.get(i) {
+                Some(b) => {
+                    let _ = write!(out, "{b:02x} ");
+                }
+                None => out.push_str("   "),
+            }
+            if i == 7 {
+                out.push(' ');
+            }
+        }
+        out.push(' ');
+        for b in chunk {
+            out.push(if (0x20..0x7f).contains(b) { *b as char } else { '·' });
+        }
+        out.push('\n');
+    }
+    if bytes.len() > HEX_DUMP_CAP {
+        let _ = write!(
+            out,
+            "… {} more bytes not shown ({} total)",
+            bytes.len() - HEX_DUMP_CAP,
+            bytes.len()
+        );
+    }
+    out
 }
 
 /// True for value kinds that read better right-aligned (numbers).
@@ -130,12 +198,20 @@ fn cell_context_menu_impl(
     if ui.button("View cell").clicked() {
         *action = GridAction::ViewCell {
             title: format!("{col_name} (row {})", row_idx + 1),
-            content: v.display(),
+            content: viewer_content(v),
         };
         ui.close_menu();
     }
     if ui.button("Copy cell").clicked() {
         ui.output_mut(|o| o.copied_text = v.display());
+        ui.close_menu();
+    }
+    if ui
+        .button("Find in results…")
+        .on_hover_text("Ctrl+Shift+F")
+        .clicked()
+    {
+        *action = GridAction::OpenFind;
         ui.close_menu();
     }
     if editable {
@@ -264,7 +340,7 @@ fn column_stats(result: &ResultSet, col: usize) -> String {
 }
 
 pub fn draw(ui: &mut egui::Ui, result: &ResultSet) -> GridAction {
-    draw_impl(ui, result, None)
+    draw_impl(ui, result, None, None)
 }
 
 /// Grid with in-place cell editing (single-table SELECTs whose PK is in the
@@ -274,13 +350,24 @@ pub fn draw_editable(
     result: &ResultSet,
     edit: &mut Option<super::CellEdit>,
 ) -> GridAction {
-    draw_impl(ui, result, Some(edit))
+    draw_impl(ui, result, Some(edit), None)
+}
+
+/// Grid with optional editing and find-in-results highlighting.
+pub fn draw_with_find(
+    ui: &mut egui::Ui,
+    result: &ResultSet,
+    edit: Option<&mut Option<super::CellEdit>>,
+    find: Option<&GridFind>,
+) -> GridAction {
+    draw_impl(ui, result, edit, find)
 }
 
 fn draw_impl(
     ui: &mut egui::Ui,
     result: &ResultSet,
     mut edit: Option<&mut Option<super::CellEdit>>,
+    find: Option<&GridFind>,
 ) -> GridAction {
     let mut action = GridAction::None;
     if let Some(n) = result.rows_affected {
@@ -336,6 +423,9 @@ fn draw_impl(
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::exact(INDEX_COL_W));
+            if let Some(r) = find.and_then(|f| f.scroll_to_row) {
+                builder = builder.scroll_to_row(r, Some(egui::Align::Center));
+            }
             for _ in &result.columns {
                 builder = builder.column(Column::initial(DATA_COL_W).at_least(40.0).clip(true));
             }
@@ -424,6 +514,31 @@ fn draw_impl(
                                     return;
                                 }
                                 let resp = value_cell(ui, v);
+                                if let Some(f) = find {
+                                    if !f.query_lower.is_empty()
+                                        && cell_matches(v, &f.query_lower)
+                                    {
+                                        let rect = ui.max_rect();
+                                        if f.current == Some((i, ci)) {
+                                            ui.painter().rect(
+                                                rect,
+                                                2.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 170, 0, 46,
+                                                ),
+                                                egui::Stroke::new(1.0, theme::ACCENT),
+                                            );
+                                        } else {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                2.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 213, 0, 28,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
                                 let resp = if edit.is_some() {
                                     resp.interact(egui::Sense::click())
                                 } else {

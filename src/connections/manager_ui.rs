@@ -454,6 +454,18 @@ fn draw_conn_row(
                 *tree_action = TreeAction::UsersAndRoles(conn);
                 ui.close_menu();
             }
+            if !profile.kind.is_file_based()
+                && ui
+                    .button("Top queries…")
+                    .on_hover_text(
+                        "Statement statistics from the server, heaviest first \
+                         (pg_stat_statements / performance_schema / query stats DMVs)",
+                    )
+                    .clicked()
+            {
+                *tree_action = TreeAction::TopQueries(conn);
+                ui.close_menu();
+            }
             ui.separator();
             if ui.button("Disconnect").clicked() {
                 *action = ManagerAction::Disconnect { profile_id: profile.id };

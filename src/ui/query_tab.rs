@@ -32,6 +32,8 @@ pub enum QueryTabAction {
     DeleteRow { row: usize },
     /// Re-run the last query without the row cap.
     FetchAll,
+    /// Commit (true) or roll back (false) the tab's manual transaction.
+    TxEnd { commit: bool },
 }
 
 pub fn draw(
@@ -40,6 +42,7 @@ pub fn draw(
     schema_cache: Option<&Arc<SchemaCache>>,
     dialect: DbKind,
     line_numbers: bool,
+    tx_supported: bool,
 ) -> QueryTabAction {
     let mut action = QueryTabAction::None;
 
@@ -94,6 +97,58 @@ pub fn draw(
             .clicked()
         {
             action = QueryTabAction::Export;
+        }
+        if tx_supported {
+            ui.separator();
+            if ui
+                .add_enabled(
+                    !tab.tx_open && !tab.tx_busy,
+                    egui::SelectableLabel::new(tab.manual_commit, "🔒 manual"),
+                )
+                .on_hover_text(
+                    "Manual commit: every Run goes into one transaction on a \
+                     dedicated connection until you Commit or Rollback",
+                )
+                .clicked()
+            {
+                tab.manual_commit = !tab.manual_commit;
+            }
+            if tab.tx_busy {
+                ui.spinner();
+            } else if tab.tx_open {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "⛁ tx · {} stmt{}",
+                        tab.tx_statements,
+                        if tab.tx_statements == 1 { "" } else { "s" }
+                    ),
+                );
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new(
+                            egui::RichText::new("Commit")
+                                .color(super::theme::success_color(ui)),
+                        ),
+                    )
+                    .clicked()
+                {
+                    action = QueryTabAction::TxEnd { commit: true };
+                }
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new(
+                            egui::RichText::new("Rollback")
+                                .color(ui.visuals().error_fg_color),
+                        ),
+                    )
+                    .clicked()
+                {
+                    action = QueryTabAction::TxEnd { commit: false };
+                }
+            }
         }
         ui.separator();
         if ui.button("📂").on_hover_text("Open .sql file…").clicked() {
@@ -184,6 +239,15 @@ pub fn draw(
         tab.force_reopen = true;
     }
 
+    // Ctrl+Shift+F opens find-in-results over the grid (checked before the
+    // plain Ctrl+F editor find so the combos don't shadow each other).
+    if ui.ctx().input_mut(|i| {
+        i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::F)
+    }) {
+        tab.grid_find_open = true;
+        tab.grid_find_focus = true;
+    }
+
     // Ctrl+F toggles find/replace, seeded from a single-line selection.
     if ui
         .ctx()
@@ -196,6 +260,15 @@ pub fn draw(
                 tab.find_text = sel.clone();
             }
         }
+    }
+    // Grid-find Escape is consumed so it doesn't also close the editor find.
+    if tab.grid_find_open
+        && !tab.completion.open
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        tab.grid_find_open = false;
     }
     if tab.find_open && !tab.completion.open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         tab.find_open = false;
@@ -455,15 +528,13 @@ pub fn draw(
         if can_edit {
             draw_insert_row_controls(ui, tab, &mut action);
         }
+        let find = draw_grid_find_bar(ui, tab, idx);
         // Salt with the tab id AND result index so each set's ScrollArea/Table
         // state stays independent.
         let grid_action = ui
             .push_id(("results_grid", tab.id, idx), |ui| {
-                if can_edit {
-                    super::results_grid::draw_editable(ui, &tab.results[idx], &mut tab.grid_edit)
-                } else {
-                    super::results_grid::draw(ui, &tab.results[idx])
-                }
+                let edit = if can_edit { Some(&mut tab.grid_edit) } else { None };
+                super::results_grid::draw_with_find(ui, &tab.results[idx], edit, find.as_ref())
             })
             .inner;
         match grid_action {
@@ -475,6 +546,10 @@ pub fn draw(
             }
             super::results_grid::GridAction::DeleteRow { row } => {
                 action = QueryTabAction::DeleteRow { row };
+            }
+            super::results_grid::GridAction::OpenFind => {
+                tab.grid_find_open = true;
+                tab.grid_find_focus = true;
             }
             super::results_grid::GridAction::None => {}
         }
@@ -815,6 +890,108 @@ fn draw_find_bar(ui: &mut egui::Ui, tab: &mut QueryTab) {
             tab.scroll_to_char = Some(s);
         }
     }
+}
+
+/// Find-in-results bar over the grid. Returns the per-frame find spec the
+/// grid uses for highlighting and scroll-to-match.
+fn draw_grid_find_bar(
+    ui: &mut egui::Ui,
+    tab: &mut QueryTab,
+    idx: usize,
+) -> Option<super::results_grid::GridFind> {
+    if !tab.grid_find_open {
+        return None;
+    }
+    let just_opened = tab.grid_find_focus;
+    let mut navigated = false;
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        ui.label("🔍");
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut tab.grid_find_text)
+                .id(egui::Id::new(("grid_find_field", tab.id)))
+                .hint_text("find in results")
+                .desired_width(220.0),
+        );
+        if tab.grid_find_focus {
+            resp.request_focus();
+            tab.grid_find_focus = false;
+        }
+        changed = resp.changed();
+
+        // (Re)compute matches when the needle or the shown result changed.
+        let needle = tab.grid_find_text.to_lowercase();
+        let stale = match &tab.grid_find_cache {
+            Some((n, i, _)) => *n != needle || *i != idx,
+            None => true,
+        };
+        if stale {
+            let mut matches = Vec::new();
+            if !needle.is_empty() {
+                for (ri, row) in tab.results[idx].rows.iter().enumerate() {
+                    for (ci, v) in row.iter().enumerate() {
+                        if super::results_grid::cell_matches(v, &needle) {
+                            matches.push((ri, ci));
+                        }
+                    }
+                }
+            }
+            tab.grid_find_cache = Some((needle, idx, matches));
+            tab.grid_find_index = 0;
+        }
+        let n = tab.grid_find_cache.as_ref().map_or(0, |(_, _, m)| m.len());
+        if tab.grid_find_index >= n {
+            tab.grid_find_index = 0;
+        }
+
+        // Enter cycles forward, Shift+Enter backward, while the field is focused.
+        let (enter, shift) =
+            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+        if (resp.lost_focus() || resp.has_focus()) && enter && n > 0 {
+            tab.grid_find_index = if shift {
+                (tab.grid_find_index + n - 1) % n
+            } else {
+                (tab.grid_find_index + 1) % n
+            };
+            navigated = true;
+            tab.grid_find_focus = true; // Enter keeps cycling
+        }
+        if ui.add_enabled(n > 0, egui::Button::new("◀").small()).clicked() {
+            tab.grid_find_index = (tab.grid_find_index + n - 1) % n;
+            navigated = true;
+        }
+        if ui.add_enabled(n > 0, egui::Button::new("▶").small()).clicked() {
+            tab.grid_find_index = (tab.grid_find_index + 1) % n;
+            navigated = true;
+        }
+        if !tab.grid_find_text.is_empty() {
+            let count = if n == 0 {
+                "0 matches".to_owned()
+            } else {
+                format!("{}/{}", tab.grid_find_index + 1, n)
+            };
+            ui.label(egui::RichText::new(count).small().color(ui.visuals().weak_text_color()));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("✖").on_hover_text("Close (Esc)").clicked() {
+                tab.grid_find_open = false;
+            }
+        });
+    });
+    ui.add_space(2.0);
+
+    let (needle, matches) = match &tab.grid_find_cache {
+        Some((n, _, m)) => (n.clone(), m),
+        None => return None,
+    };
+    let current = matches.get(tab.grid_find_index).copied();
+    let scroll_to_row = if changed || navigated || just_opened {
+        current.map(|(r, _)| r)
+    } else {
+        None
+    };
+    Some(super::results_grid::GridFind { query_lower: needle, current, scroll_to_row })
 }
 
 fn apply_completion(tab: &mut QueryTab, item: &CompletionItem) {

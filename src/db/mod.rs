@@ -136,6 +136,31 @@ pub trait Driver: Send + Sync {
     /// (Postgres, SQL Server), sequentially with stop-on-error otherwise
     /// (MySQL). Returns how many statements actually took effect.
     async fn apply_ddl(&self, statements: &[String]) -> structure::DdlOutcome;
+    /// Whether `begin_tx` works for this driver (drives the UI toggle).
+    fn supports_tx_sessions(&self) -> bool {
+        false
+    }
+    /// Start a manual (user-driven) transaction on a dedicated connection.
+    /// The session holds that connection until commit/rollback.
+    async fn begin_tx(&self) -> Result<Box<dyn TxSession>> {
+        anyhow::bail!("Manual transactions aren't supported for this database")
+    }
+}
+
+/// A user-driven transaction pinned to one connection. Statements between
+/// begin and commit/rollback all run on that session. Implementations must
+/// never return the connection to a pool with the transaction still open —
+/// on drop without an explicit end, the raw connection is closed instead
+/// (the server then rolls back).
+#[async_trait]
+pub trait TxSession: Send {
+    async fn query_script(
+        &mut self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>>;
+    async fn commit(&mut self) -> Result<()>;
+    async fn rollback(&mut self) -> Result<()>;
 }
 
 pub type DynDriver = Arc<dyn Driver>;

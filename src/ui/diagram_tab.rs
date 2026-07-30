@@ -203,6 +203,8 @@ pub enum DiagramAction {
     /// Re-introspect the owning connection and merge into the source text.
     RefreshFromDb,
     Status(String),
+    /// Save this rendered SVG document via a file dialog.
+    ExportSvg(String),
 }
 
 pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab, line_numbers: bool) -> DiagramAction {
@@ -238,6 +240,24 @@ pub fn draw(ui: &mut egui::Ui, tab: &mut DiagramTab, line_numbers: bool) -> Diag
             tab.layout.tables.clear();
             tab.want_fit = true;
             tab.save_layout();
+        }
+        if ui
+            .button("Export SVG")
+            .on_hover_text("Save the diagram as an SVG image (current layout, 1:1)")
+            .clicked()
+        {
+            match &tab.model {
+                Some(m) if !tab.node_sizes.is_empty() => {
+                    let svg =
+                        crate::ui::diagram_svg::export_svg(tab, m, ui.visuals().dark_mode);
+                    action = DiagramAction::ExportSvg(svg);
+                }
+                _ => {
+                    action = DiagramAction::Status(
+                        "Nothing to export — fix the DBML source first".into(),
+                    );
+                }
+            }
         }
         if ui
             .button("Suggest groups")

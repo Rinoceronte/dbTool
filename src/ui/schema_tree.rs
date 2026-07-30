@@ -20,6 +20,8 @@ pub enum TreeAction {
     OpenSessions(ConnectionId),
     /// Open a query tab listing the server's users/roles.
     UsersAndRoles(ConnectionId),
+    /// Open a query tab listing the server's heaviest statements.
+    TopQueries(ConnectionId),
     /// Open the data compare / sanitized pull tab, sourced from this conn.
     DataSync(ConnectionId),
     /// Open the column-mapped cross-connection transfer tab.
@@ -44,6 +46,8 @@ pub enum TreeAction {
     RoutineDdl(ConnectionId, String, String, String),
     /// Open a view's CREATE statement in a query tab (schema, view).
     ViewDefinition(ConnectionId, String, String),
+    /// Open a query tab listing who holds which privileges on schema.table.
+    ViewGrants(ConnectionId, String, String),
 }
 
 /// The schema/table tree for one connected connection; the connection card
@@ -152,6 +156,16 @@ pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection) -> TreeAction {
                             }
                             if ui.button("Export data to file…").clicked() {
                                 action = TreeAction::ExportFrom(
+                                    conn.conn_id,
+                                    schema.name.clone(),
+                                    t.name.clone(),
+                                );
+                                ui.close_menu();
+                            }
+                            if conn.kind != crate::db::DbKind::Sqlite
+                                && ui.button("View grants").clicked()
+                            {
+                                action = TreeAction::ViewGrants(
                                     conn.conn_id,
                                     schema.name.clone(),
                                     t.name.clone(),

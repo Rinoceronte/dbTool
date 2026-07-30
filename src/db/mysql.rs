@@ -56,6 +56,96 @@ async fn run_script_on(
     Ok(sets)
 }
 
+/// Single entry point for editor SQL on a pinned connection: scripts run
+/// statement-by-statement, routine DDL goes down the raw path, and single
+/// statements pick the fetch/execute path by leading keyword.
+async fn run_any_on(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+    sql: &str,
+) -> Result<Vec<ResultSet>> {
+    use sqlx::Executor as _;
+    if crate::db::is_multi_statement(sql) && !crate::db::is_routine_ddl(sql) {
+        run_script_on(conn, sql).await
+    } else if crate::db::is_routine_ddl(sql) {
+        let res = conn.execute(sqlx::raw_sql(sql)).await?;
+        Ok(vec![ResultSet {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: Some(res.rows_affected()),
+            truncated: false,
+        }])
+    } else {
+        let returns_rows = matches!(
+            crate::db::leading_keyword(sql).as_str(),
+            "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+        );
+        if returns_rows {
+            Ok(vec![fetch_capped(&mut **conn, sql).await?])
+        } else {
+            let res = conn.execute(sqlx::query(sql)).await?;
+            Ok(vec![ResultSet {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: Some(res.rows_affected()),
+                truncated: false,
+            }])
+        }
+    }
+}
+
+/// Manual transaction pinned to one pooled connection; the connection is
+/// detached on drop if the transaction was never explicitly ended.
+pub struct MySqlTxSession {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::MySql>>,
+    pool: MySqlPool,
+    cid: u64,
+}
+
+impl Drop for MySqlTxSession {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+#[async_trait]
+impl super::TxSession for MySqlTxSession {
+    async fn query_script(
+        &mut self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        let cid = self.cid;
+        let conn = self.conn.as_mut().ok_or_else(|| anyhow!("transaction already ended"))?;
+        // KILL QUERY aborts the statement but keeps the session (and its
+        // transaction) alive, so cancel is issued from a second connection.
+        let pool = self.pool.clone();
+        let c2 = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            c2.cancelled().await;
+            let _ = sqlx::query(&format!("KILL QUERY {cid}")).execute(&pool).await;
+        });
+        let r = run_any_on(conn, sql).await;
+        watcher.abort();
+        r
+    }
+
+    async fn commit(&mut self) -> Result<()> {
+        use sqlx::Executor as _;
+        let mut conn = self.conn.take().ok_or_else(|| anyhow!("transaction already ended"))?;
+        conn.execute(sqlx::query("COMMIT")).await?;
+        Ok(())
+    }
+
+    async fn rollback(&mut self) -> Result<()> {
+        use sqlx::Executor as _;
+        let mut conn = self.conn.take().ok_or_else(|| anyhow!("transaction already ended"))?;
+        conn.execute(sqlx::query("ROLLBACK")).await?;
+        Ok(())
+    }
+}
+
 impl MySqlDriver {
     pub async fn connect(params: &ConnectParams) -> Result<Self> {
         let pool = MySqlPoolOptions::new()
@@ -341,46 +431,31 @@ impl Driver for MySqlDriver {
         }
     }
 
-    async fn query_script(
-        &self,
-        sql: &str,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<ResultSet>> {
+    fn supports_tx_sessions(&self) -> bool {
+        true
+    }
+
+    async fn begin_tx(&self) -> Result<Box<dyn super::TxSession>> {
         use sqlx::Executor as _;
         let mut conn = self.pool.acquire().await?;
         let cid: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
             .fetch_one(&mut *conn)
             .await?;
+        conn.execute(sqlx::query("BEGIN")).await?;
+        Ok(Box::new(MySqlTxSession { conn: Some(conn), pool: self.pool.clone(), cid }))
+    }
+
+    async fn query_script(
+        &self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        let mut conn = self.pool.acquire().await?;
+        let cid: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *conn)
+            .await?;
         let outcome = {
-            let fut = async {
-                if crate::db::is_multi_statement(sql) && !crate::db::is_routine_ddl(sql) {
-                    run_script_on(&mut conn, sql).await
-                } else if crate::db::is_routine_ddl(sql) {
-                    let res = conn.execute(sqlx::raw_sql(sql)).await?;
-                    Ok(vec![ResultSet {
-                        columns: vec![],
-                        rows: vec![],
-                        rows_affected: Some(res.rows_affected()),
-                        truncated: false,
-                    }])
-                } else {
-                    let returns_rows = matches!(
-                        crate::db::leading_keyword(sql).as_str(),
-                        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
-                    );
-                    if returns_rows {
-                        Ok(vec![fetch_capped(&mut *conn, sql).await?])
-                    } else {
-                        let res = conn.execute(sqlx::query(sql)).await?;
-                        Ok(vec![ResultSet {
-                            columns: vec![],
-                            rows: vec![],
-                            rows_affected: Some(res.rows_affected()),
-                            truncated: false,
-                        }])
-                    }
-                }
-            };
+            let fut = run_any_on(&mut conn, sql);
             tokio::select! {
                 r = fut => Some(r),
                 _ = cancel.cancelled() => None,

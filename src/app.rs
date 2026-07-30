@@ -33,6 +33,11 @@ enum Pending {
     RoutineDdl,
     DescribeTable(TabId),
     Query(TabId),
+    /// Opening a manual transaction for a query tab (the run that triggered
+    /// it is parked in `pending_tx_sql`).
+    TxBegin(TabId),
+    /// A commit/rollback of a query tab's manual transaction.
+    TxEnd(TabId),
     TableRows(TabId),
     /// Row fetch for the FK-peek popup.
     FkPeek,
@@ -109,6 +114,9 @@ pub struct App {
     import_dialog: Option<ImportState>,
     export_dialog: Option<ExportState>,
     dbml_file_dialog: egui_file_dialog::FileDialog,
+    /// Diagram SVG export: picker plus the rendered document awaiting a path.
+    svg_export_dialog: egui_file_dialog::FileDialog,
+    pending_svg_export: Option<String>,
     /// File dialog for query-tab .sql open/save, plus which tab it serves.
     sql_file_dialog: egui_file_dialog::FileDialog,
     sql_file_target: Option<(TabId, SqlFileMode)>,
@@ -119,6 +127,10 @@ pub struct App {
     close_armed: Option<TabId>,
     /// Full-value cell viewer window: (title, content).
     cell_viewer: Option<(String, String)>,
+    /// Cell viewer: soft-wrap long lines instead of horizontal scrolling.
+    cell_viewer_wrap: bool,
+    /// Cell viewer: show JSON content as a foldable tree.
+    cell_viewer_tree: bool,
     /// FK "peek" popup: the referenced row(s), without leaving the current tab.
     fk_peek: Option<FkPeek>,
     /// Hover preview over an FK cell; appears after a short dwell.
@@ -255,11 +267,16 @@ impl App {
             import_dialog: None,
             export_dialog: None,
             dbml_file_dialog: egui_file_dialog::FileDialog::new(),
+            svg_export_dialog: egui_file_dialog::FileDialog::new()
+                .default_file_name("diagram.svg"),
+            pending_svg_export: None,
             sql_file_dialog: egui_file_dialog::FileDialog::new(),
             sql_file_target: None,
             db_picker: None,
             close_armed: None,
             cell_viewer: None,
+            cell_viewer_wrap: false,
+            cell_viewer_tree: true,
             fk_peek: None,
             fk_hover: None,
             history_open: false,
@@ -758,6 +775,10 @@ impl App {
                         t.results = results;
                         t.status = TabStatus::Info(info);
                         t.grid_edit = None;
+                        t.grid_find_cache = None;
+                        if t.tx_open {
+                            t.tx_statements += 1;
+                        }
                     }
                     // Single-table SELECT with its PK in the projection →
                     // the grid becomes editable.
@@ -954,6 +975,48 @@ impl App {
             }
             Event::AiSessionEnded { session } => {
                 self.ai_panel.session_ended(session);
+            }
+            Event::TxStarted { req } => {
+                let Some(op) = self.pending.remove(&req) else { return };
+                if let Pending::TxBegin(tab_id) = op {
+                    let mut parked: Option<String> = None;
+                    if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
+                        q.tx_open = true;
+                        q.tx_busy = false;
+                        q.tx_statements = 0;
+                        parked = q.pending_tx_sql.take();
+                        if parked.is_some() {
+                            q.status = TabStatus::Running("running…".into());
+                        }
+                    }
+                    // Run the statement that triggered the begin.
+                    if let Some(sql) = parked {
+                        let req2 = RequestId::new_v4();
+                        if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
+                            q.running_req = Some(req2);
+                        }
+                        self.pending.insert(req2, Pending::Query(tab_id));
+                        self.runtime.send(Command::TxQuery {
+                            req: req2,
+                            tab: tab_id,
+                            sql,
+                            unlimited: false,
+                        });
+                    }
+                }
+            }
+            Event::TxEnded { req, committed } => {
+                let Some(op) = self.pending.remove(&req) else { return };
+                if let Pending::TxEnd(tab_id) = op {
+                    if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
+                        q.tx_open = false;
+                        q.tx_busy = false;
+                        q.tx_statements = 0;
+                        q.status = TabStatus::Info(
+                            if committed { "✔ committed" } else { "rolled back" }.into(),
+                        );
+                    }
+                }
             }
             Event::UpdateAvailable { info } => {
                 self.update_banner = Some(info);
@@ -1317,6 +1380,24 @@ impl App {
                             t.status = TabStatus::Error(error);
                         }
                     }
+                    Some(Pending::TxBegin(tab_id)) => {
+                        if let Some(Tab::Query(t)) = self.find_tab_mut(tab_id) {
+                            t.tx_busy = false;
+                            t.pending_tx_sql = None;
+                            t.running_req = None;
+                            t.status = TabStatus::Error(error);
+                        }
+                    }
+                    Some(Pending::TxEnd(tab_id)) => {
+                        // The runtime drops the session on a failed end; its
+                        // connection closes, so the server rolled back.
+                        if let Some(Tab::Query(t)) = self.find_tab_mut(tab_id) {
+                            t.tx_busy = false;
+                            t.tx_open = false;
+                            t.tx_statements = 0;
+                            t.status = TabStatus::Error(error);
+                        }
+                    }
                     Some(Pending::TableRows(tab_id))
                     | Some(Pending::RowInsert(tab_id))
                     | Some(Pending::ApplyChanges(tab_id))
@@ -1555,13 +1636,13 @@ impl App {
     /// Run (or EXPLAIN) the active SQL of a query tab, recording history and
     /// the request id for cancellation.
     fn run_query_tab(&mut self, tab_id: TabId, explain: bool) {
-        let (conn, sql, full_run) = {
+        let (conn, sql, full_run, manual) = {
             let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) else { return };
             let sql = q.selected_sql.clone().unwrap_or_else(|| q.sql.clone());
             if sql.trim().is_empty() {
                 return;
             }
-            (q.conn_id, sql, !explain && q.selected_sql.is_none())
+            (q.conn_id, sql, !explain && q.selected_sql.is_none(), q.manual_commit)
         };
         if !self.active.iter().any(|a| a.conn_id == conn) {
             if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
@@ -1574,7 +1655,8 @@ impl App {
         // Refuse a transaction left open past the end of the script: the
         // connection returns to the pool afterwards, so the open transaction
         // would either leak (idle-in-transaction) or be silently lost.
-        if !explain && !crate::db::is_routine_ddl(&sql) && has_dangling_transaction(&sql) {
+        // Manual-commit tabs hold a dedicated session, so the guard is moot.
+        if !explain && !manual && !crate::db::is_routine_ddl(&sql) && has_dangling_transaction(&sql) {
             if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
                 q.status = TabStatus::Error(
                     "BEGIN without COMMIT/ROLLBACK: transactions cannot span separate Runs \
@@ -1668,8 +1750,12 @@ impl App {
     }
 
     /// The tail of a Run: set status, record the request, send the command.
+    /// Manual-commit tabs route through their transaction session instead of
+    /// the pooled query path, opening the transaction first when needed.
     fn dispatch_query(&mut self, tab_id: TabId, conn: ConnectionId, run_sql: String, full_run: bool) {
         let req = RequestId::new_v4();
+        let mut manual = false;
+        let mut tx_open = false;
         if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
             q.status = TabStatus::Running("running…".into());
             q.running_req = Some(req);
@@ -1678,9 +1764,36 @@ impl App {
             // and the whole buffer was what ran.
             q.last_run_sql = full_run.then(|| q.sql.clone());
             q.last_executed_sql = Some(run_sql.clone());
+            manual = q.manual_commit;
+            tx_open = q.tx_open;
+            if manual && !tx_open {
+                q.pending_tx_sql = Some(run_sql.clone());
+                q.tx_busy = true;
+                q.status = TabStatus::Running("starting transaction…".into());
+            }
         }
-        self.pending.insert(req, Pending::Query(tab_id));
-        self.runtime.send(Command::Query { req, conn, sql: run_sql, unlimited: false });
+        if manual && tx_open {
+            self.pending.insert(req, Pending::Query(tab_id));
+            self.runtime.send(Command::TxQuery { req, tab: tab_id, sql: run_sql, unlimited: false });
+        } else if manual {
+            self.pending.insert(req, Pending::TxBegin(tab_id));
+            self.runtime.send(Command::TxBegin { req, conn, tab: tab_id });
+        } else {
+            self.pending.insert(req, Pending::Query(tab_id));
+            self.runtime.send(Command::Query { req, conn, sql: run_sql, unlimited: false });
+        }
+    }
+
+    /// Commit or roll back a query tab's manual transaction.
+    fn end_query_tx(&mut self, tab_id: TabId, commit: bool) {
+        let req = RequestId::new_v4();
+        let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) else { return };
+        if !q.tx_open || q.tx_busy {
+            return;
+        }
+        q.tx_busy = true;
+        self.pending.insert(req, Pending::TxEnd(tab_id));
+        self.runtime.send(Command::TxEnd { req, tab: tab_id, commit });
     }
 
     /// Modal asking for `:name` / `?` values before a parameterized run.
@@ -1890,12 +2003,18 @@ impl App {
         let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) else { return };
         let Some(sql) = q.last_executed_sql.clone() else { return };
         let conn = q.conn_id;
+        let tx_open = q.tx_open;
         let req = RequestId::new_v4();
         q.status = TabStatus::Running("fetching all rows…".into());
         q.running_req = Some(req);
-            q.run_started = Some(std::time::Instant::now());
+        q.run_started = Some(std::time::Instant::now());
         self.pending.insert(req, Pending::Query(tab_id));
-        self.runtime.send(Command::Query { req, conn, sql, unlimited: true });
+        if tx_open {
+            // Stay on the transaction session so the re-run sees its writes.
+            self.runtime.send(Command::TxQuery { req, tab: tab_id, sql, unlimited: true });
+        } else {
+            self.runtime.send(Command::Query { req, conn, sql, unlimited: true });
+        }
     }
 
     /// Save a query tab's SQL to its file, or ask for a path first.
@@ -1959,6 +2078,99 @@ impl App {
             crate::db::DbKind::Sqlite => return,
         };
         if let Some(tab_id) = self.open_query_tab(conn_id, sql.to_owned()) {
+            self.run_query_tab(tab_id, false);
+        }
+    }
+
+    /// "Top queries…": a query tab with the dialect's statement-statistics
+    /// view, heaviest total time first, run immediately.
+    fn open_top_queries_tab(&mut self, conn_id: ConnectionId) {
+        let Some(kind) = self.find_active_by_conn(conn_id).map(|a| a.kind) else { return };
+        let sql = match kind {
+            crate::db::DbKind::Postgres => {
+                "-- Requires the pg_stat_statements extension:\n\
+                 --   shared_preload_libraries = 'pg_stat_statements' + CREATE EXTENSION pg_stat_statements;\n\
+                 -- Reset the counters with: SELECT pg_stat_statements_reset();\n\
+                 SELECT left(regexp_replace(query, '\\s+', ' ', 'g'), 120) AS query,\n\
+                        calls,\n\
+                        round(total_exec_time::numeric, 1)  AS total_ms,\n\
+                        round(mean_exec_time::numeric, 2)   AS mean_ms,\n\
+                        rows,\n\
+                        round((100 * total_exec_time / sum(total_exec_time) OVER ())::numeric, 1) AS pct_of_total\n\
+                 FROM pg_stat_statements\n\
+                 ORDER BY total_exec_time DESC\n\
+                 LIMIT 50"
+            }
+            crate::db::DbKind::MySql => {
+                "-- Requires performance_schema = ON (default since 5.6).\n\
+                 -- Reset with: TRUNCATE performance_schema.events_statements_summary_by_digest;\n\
+                 SELECT LEFT(digest_text, 120)              AS query,\n\
+                        count_star                          AS calls,\n\
+                        ROUND(sum_timer_wait / 1e9, 1)      AS total_ms,\n\
+                        ROUND(avg_timer_wait / 1e9, 2)      AS mean_ms,\n\
+                        sum_rows_sent                       AS rows_sent,\n\
+                        sum_rows_examined                   AS rows_examined\n\
+                 FROM performance_schema.events_statements_summary_by_digest\n\
+                 WHERE digest_text IS NOT NULL\n\
+                 ORDER BY sum_timer_wait DESC\n\
+                 LIMIT 50"
+            }
+            crate::db::DbKind::MsSql => {
+                "-- Cached-plan statistics; times are microseconds in the DMV (shown as ms).\n\
+                 SELECT TOP 50\n\
+                        SUBSTRING(qt.text, 1, 120)                              AS query,\n\
+                        qs.execution_count                                      AS calls,\n\
+                        qs.total_elapsed_time / 1000                            AS total_ms,\n\
+                        qs.total_elapsed_time / qs.execution_count / 1000       AS mean_ms,\n\
+                        qs.total_rows                                           AS total_rows\n\
+                 FROM sys.dm_exec_query_stats qs\n\
+                 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt\n\
+                 ORDER BY qs.total_elapsed_time DESC"
+            }
+            crate::db::DbKind::Sqlite => return,
+        };
+        if let Some(tab_id) = self.open_query_tab(conn_id, sql.to_owned()) {
+            if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
+                q.title = "top queries".to_owned();
+            }
+            self.run_query_tab(tab_id, false);
+        }
+    }
+
+    /// "View grants": a query tab listing who holds which privileges on one
+    /// table/view, run immediately.
+    fn open_grants_tab(&mut self, conn_id: ConnectionId, schema: &str, table: &str) {
+        let Some(kind) = self.find_active_by_conn(conn_id).map(|a| a.kind) else { return };
+        let s = schema.replace('\'', "''");
+        let t = table.replace('\'', "''");
+        let sql = match kind {
+            crate::db::DbKind::Postgres => format!(
+                "SELECT grantee, privilege_type, is_grantable \
+                 FROM information_schema.role_table_grants \
+                 WHERE table_schema = '{s}' AND table_name = '{t}' \
+                 ORDER BY grantee, privilege_type"
+            ),
+            crate::db::DbKind::MySql => format!(
+                "SELECT grantee, privilege_type, is_grantable \
+                 FROM information_schema.table_privileges \
+                 WHERE table_schema = '{s}' AND table_name = '{t}' \
+                 ORDER BY grantee, privilege_type"
+            ),
+            crate::db::DbKind::MsSql => format!(
+                "SELECT pr.name AS principal, pr.type_desc AS principal_type, \
+                        pe.permission_name, pe.state_desc \
+                 FROM sys.database_permissions pe \
+                 JOIN sys.database_principals pr \
+                   ON pe.grantee_principal_id = pr.principal_id \
+                 WHERE pe.class = 1 AND pe.major_id = OBJECT_ID('{s}.{t}') \
+                 ORDER BY pr.name, pe.permission_name"
+            ),
+            crate::db::DbKind::Sqlite => return,
+        };
+        if let Some(tab_id) = self.open_query_tab(conn_id, sql) {
+            if let Some(Tab::Query(q)) = self.find_tab_mut(tab_id) {
+                q.title = format!("grants · {table}");
+            }
             self.run_query_tab(tab_id, false);
         }
     }
@@ -2646,6 +2858,21 @@ impl App {
     }
 
     fn disconnect_profile(&mut self, profile_id: Uuid) {
+        // Roll back (and free) any open manual transactions of this profile's
+        // tabs before their connections go away.
+        let tx_tabs: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Query(q) if q.profile_id == profile_id && q.tx_open => Some(q.id),
+                _ => None,
+            })
+            .collect();
+        for tab in tx_tabs {
+            let req = RequestId::new_v4();
+            self.pending.insert(req, Pending::TxEnd(tab));
+            self.runtime.send(Command::TxEnd { req, tab, commit: false });
+        }
         let conn_ids: Vec<ConnectionId> = self
             .active
             .iter()
@@ -2673,6 +2900,20 @@ impl App {
             return;
         };
         let conn_id = self.active[pos].conn_id;
+        // Free open manual transactions before their connection goes away.
+        let tx_tabs: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Query(q) if q.conn_id == conn_id && q.tx_open => Some(q.id),
+                _ => None,
+            })
+            .collect();
+        for tab in tx_tabs {
+            let req = RequestId::new_v4();
+            self.pending.insert(req, Pending::TxEnd(tab));
+            self.runtime.send(Command::TxEnd { req, tab, commit: false });
+        }
         self.runtime.send(Command::Disconnect { conn: conn_id });
         self.active.remove(pos);
         // Query tabs survive a disconnect (detached consoles, re-attached on
@@ -2682,6 +2923,10 @@ impl App {
                 if q.conn_id == conn_id {
                     q.status = TabStatus::Info("disconnected".into());
                     q.running_req = None;
+                    q.tx_open = false;
+                    q.tx_busy = false;
+                    q.tx_statements = 0;
+                    q.pending_tx_sql = None;
                 }
             }
         }
@@ -3822,11 +4067,15 @@ impl App {
         }
     }
 
-    /// Full-value viewer for one cell (JSON pretty-printing on demand).
+    /// Full-value viewer for one cell: plain text with a wrap toggle, plus a
+    /// foldable tree mode whenever the content parses as JSON.
     fn draw_cell_viewer(&mut self, ctx: &egui::Context) {
         let Some((title, content)) = self.cell_viewer.clone() else { return };
         let mut open = true;
         let mut new_content: Option<String> = None;
+        let mut wrap = self.cell_viewer_wrap;
+        let mut tree = self.cell_viewer_tree;
+        let as_json = serde_json::from_str::<serde_json::Value>(&content).ok();
         egui::Window::new(format!("Cell — {title}"))
             .open(&mut open)
             .resizable(true)
@@ -3836,23 +4085,40 @@ impl App {
                     if ui.button("📋 Copy").clicked() {
                         ui.output_mut(|o| o.copied_text = content.clone());
                     }
-                    let as_json = serde_json::from_str::<serde_json::Value>(&content).ok();
-                    if let Some(v) = as_json {
-                        if ui.button("{ } Pretty JSON").clicked() {
-                            if let Ok(pretty) = serde_json::to_string_pretty(&v) {
+                    if let Some(v) = &as_json {
+                        ui.toggle_value(&mut tree, "🌳 Tree");
+                        if ui
+                            .button("{ } Pretty")
+                            .on_hover_text("Reformat the text with indentation")
+                            .clicked()
+                        {
+                            if let Ok(pretty) = serde_json::to_string_pretty(v) {
                                 new_content = Some(pretty);
                             }
                         }
                     }
+                    ui.toggle_value(&mut wrap, "⏎ Wrap");
                     ui.weak(format!("{} chars", content.chars().count()));
                 });
                 ui.separator();
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&content).monospace()).extend(),
-                    );
+                let scroll = if wrap {
+                    egui::ScrollArea::vertical()
+                } else {
+                    egui::ScrollArea::both()
+                };
+                scroll.auto_shrink([false, false]).show(ui, |ui| {
+                    match (&as_json, tree) {
+                        (Some(v), true) => draw_json_tree(ui, "$", v, 0),
+                        _ => {
+                            let label =
+                                egui::Label::new(egui::RichText::new(&content).monospace());
+                            ui.add(if wrap { label.wrap() } else { label.extend() });
+                        }
+                    }
                 });
             });
+        self.cell_viewer_wrap = wrap;
+        self.cell_viewer_tree = tree;
         if let Some(c) = new_content {
             self.cell_viewer = Some((title, c));
         }
@@ -4289,6 +4555,20 @@ impl eframe::App for App {
             self.open_diagram_tab(picked, None);
         }
 
+        // Diagram SVG export picker.
+        self.svg_export_dialog.update(ctx);
+        if let Some(mut picked) = self.svg_export_dialog.take_selected() {
+            if let Some(svg) = self.pending_svg_export.take() {
+                if picked.extension().is_none() {
+                    picked.set_extension("svg");
+                }
+                self.status = Some(match std::fs::write(&picked, svg) {
+                    Ok(()) => format!("Diagram exported to {}", picked.display()),
+                    Err(e) => format!("SVG export failed: {e}"),
+                });
+            }
+        }
+
         // Query-tab .sql open/save picker.
         self.sql_file_dialog.update(ctx);
         if let Some(picked) = self.sql_file_dialog.take_selected() {
@@ -4551,6 +4831,18 @@ impl eframe::App for App {
                                     );
                                 } else {
                                     self.close_armed = None;
+                                    // A closing tab's open transaction rolls back.
+                                    if self.tabs.iter().any(|t| {
+                                        matches!(t, Tab::Query(q) if q.id == id && q.tx_open)
+                                    }) {
+                                        let req = RequestId::new_v4();
+                                        self.pending.insert(req, Pending::TxEnd(id));
+                                        self.runtime.send(Command::TxEnd {
+                                            req,
+                                            tab: id,
+                                            commit: false,
+                                        });
+                                    }
                                     self.tabs.retain(|t| t.id() != id);
                                     if self.active_tab == Some(id) {
                                         self.active_tab = self.tabs.first().map(|t| t.id());
@@ -4636,12 +4928,17 @@ impl eframe::App for App {
                     let ac = self.active.iter().find(|a| a.profile_id == profile_id);
                     let schema_cache = ac.and_then(|a| a.schema_cache.as_ref());
                     let dialect = ac.map(|a| a.kind).unwrap_or(crate::db::DbKind::Postgres);
+                    // The MSSQL driver shares one session for everything, so a
+                    // dedicated-transaction mode can't be offered there yet.
+                    let tx_supported =
+                        ac.is_some() && dialect != crate::db::DbKind::MsSql;
                     let action = crate::ui::query_tab::draw(
                         ui,
                         q,
                         schema_cache,
                         dialect,
                         self.settings.sql_line_numbers,
+                        tx_supported,
                     );
                     match action {
                         crate::ui::query_tab::QueryTabAction::None => {}
@@ -4737,6 +5034,12 @@ impl eframe::App for App {
                                 app.fetch_all_rows(tab_id);
                             }));
                         }
+                        crate::ui::query_tab::QueryTabAction::TxEnd { commit } => {
+                            let tab_id = q.id;
+                            pending_actions.push(Box::new(move |app: &mut Self| {
+                                app.end_query_tx(tab_id, commit);
+                            }));
+                        }
                     }
                 }
                 Tab::TableEditor(t) => {
@@ -4793,6 +5096,10 @@ impl eframe::App for App {
                             pending_actions.push(Box::new(move |app: &mut Self| {
                                 app.refresh_diagram_from_db(tab_id);
                             }));
+                        }
+                        DiagramAction::ExportSvg(svg) => {
+                            self.pending_svg_export = Some(svg);
+                            self.svg_export_dialog.save_file();
                         }
                         DiagramAction::Status(s) => {
                             pending_actions.push(Box::new(move |app: &mut Self| {
@@ -5134,6 +5441,57 @@ fn handle_table_editor_action(
     }
 }
 
+/// Foldable JSON tree for the cell viewer. Objects and arrays fold (open two
+/// levels deep by default); leaves are monospace `key: value` lines that copy
+/// their value on click.
+fn draw_json_tree(ui: &mut egui::Ui, key: &str, v: &serde_json::Value, depth: usize) {
+    use serde_json::Value as J;
+    match v {
+        J::Object(map) => {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("{key} {{{}}}", map.len())).monospace(),
+            )
+            .id_source((key, depth))
+            .default_open(depth < 2)
+            .show(ui, |ui| {
+                for (k, child) in map {
+                    draw_json_tree(ui, k, child, depth + 1);
+                }
+            });
+        }
+        J::Array(items) => {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("{key} [{}]", items.len())).monospace(),
+            )
+            .id_source((key, depth))
+            .default_open(depth < 2)
+            .show(ui, |ui| {
+                for (i, child) in items.iter().enumerate() {
+                    draw_json_tree(ui, &format!("[{i}]"), child, depth + 1);
+                }
+            });
+        }
+        leaf => {
+            let text = match leaf {
+                J::String(s) => format!("{key}: \"{s}\""),
+                other => format!("{key}: {other}"),
+            };
+            let resp = ui.add(
+                egui::Label::new(egui::RichText::new(text).monospace())
+                    .sense(egui::Sense::click()),
+            );
+            if resp.clicked() {
+                let val = match leaf {
+                    J::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                ui.output_mut(|o| o.copied_text = val);
+            }
+            resp.on_hover_text("Click to copy the value");
+        }
+    }
+}
+
 /// Queries finishing after at least this long, while the window is
 /// unfocused, raise a desktop notification.
 const NOTIFY_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
@@ -5338,6 +5696,12 @@ impl App {
             }
             T::UsersAndRoles(conn) => {
                 self.open_users_tab(conn);
+            }
+            T::ViewGrants(conn, schema, table) => {
+                self.open_grants_tab(conn, &schema, &table);
+            }
+            T::TopQueries(conn) => {
+                self.open_top_queries_tab(conn);
             }
             T::DataSync(conn) => {
                 self.open_datasync_tab(conn);

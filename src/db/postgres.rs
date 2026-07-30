@@ -38,6 +38,17 @@ impl PostgresDriver {
         conn: &mut sqlx::PgConnection,
         sql: &str,
     ) -> Result<Vec<ResultSet>> {
+        run_on_conn(&self.pool, conn, sql).await
+    }
+}
+
+/// See `PostgresDriver::run_on_conn`; free so `PgTxSession` shares it.
+async fn run_on_conn(
+    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    sql: &str,
+) -> Result<Vec<ResultSet>> {
+    {
         let cap = super::effective_row_cap();
         if super::is_multi_statement(sql) {
             use futures::TryStreamExt as _;
@@ -102,7 +113,7 @@ impl PostgresDriver {
             let mut rs = result_set_from_pg_rows(rows);
             rs.truncated = truncated;
             if rs.columns.is_empty() {
-                rs.columns = columns_via_describe(&self.pool, sql).await;
+                rs.columns = columns_via_describe(pool, sql).await;
             }
             Ok(vec![rs])
         } else {
@@ -114,6 +125,61 @@ impl PostgresDriver {
                 truncated: false,
             }])
         }
+    }
+}
+
+/// Manual transaction pinned to one pooled connection. The connection is
+/// detached on drop if the transaction was never explicitly ended, so a
+/// half-open transaction can never leak back into the pool.
+pub struct PgTxSession {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    pool: PgPool,
+    pid: i32,
+}
+
+impl Drop for PgTxSession {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+#[async_trait]
+impl super::TxSession for PgTxSession {
+    async fn query_script(
+        &mut self,
+        sql: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        let conn = self.conn.as_mut().ok_or_else(|| anyhow!("transaction already ended"))?;
+        // Cancel server-side from a second connection: the running statement
+        // errors out, the session (and its transaction) stay protocol-clean.
+        let pool = self.pool.clone();
+        let pid = self.pid;
+        let c2 = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            c2.cancelled().await;
+            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(pid)
+                .execute(&pool)
+                .await;
+        });
+        let r = run_on_conn(&self.pool, conn, sql).await;
+        watcher.abort();
+        r.map_err(annotate_pg_position)
+    }
+
+    async fn commit(&mut self) -> Result<()> {
+        let mut conn = self.conn.take().ok_or_else(|| anyhow!("transaction already ended"))?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(())
+    }
+
+    async fn rollback(&mut self) -> Result<()> {
+        let mut conn = self.conn.take().ok_or_else(|| anyhow!("transaction already ended"))?;
+        sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+        Ok(())
     }
 }
 
@@ -454,6 +520,19 @@ impl Driver for PostgresDriver {
                 truncated: false,
             })
         }
+    }
+
+    fn supports_tx_sessions(&self) -> bool {
+        true
+    }
+
+    async fn begin_tx(&self) -> Result<Box<dyn super::TxSession>> {
+        let mut conn = self.pool.acquire().await?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await?;
+        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        Ok(Box::new(PgTxSession { conn: Some(conn), pool: self.pool.clone(), pid }))
     }
 
     async fn query_script(

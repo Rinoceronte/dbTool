@@ -43,6 +43,12 @@ impl SqliteDriver {
         conn: &mut sqlx::SqliteConnection,
         sql: &str,
     ) -> Result<Vec<ResultSet>> {
+        run_on_conn(conn, sql).await
+    }
+}
+
+/// See `SqliteDriver::run_on_conn`; free so `SqliteTxSession` shares it.
+async fn run_on_conn(conn: &mut sqlx::SqliteConnection, sql: &str) -> Result<Vec<ResultSet>> {
         let cap = super::effective_row_cap();
         if super::is_multi_statement(sql) {
             use futures::TryStreamExt as _;
@@ -114,6 +120,45 @@ impl SqliteDriver {
                 truncated: false,
             }])
         }
+}
+
+/// Manual transaction pinned to one pooled connection; the connection is
+/// detached on drop if the transaction was never explicitly ended.
+pub struct SqliteTxSession {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+}
+
+impl Drop for SqliteTxSession {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+#[async_trait]
+impl super::TxSession for SqliteTxSession {
+    async fn query_script(
+        &mut self,
+        sql: &str,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<ResultSet>> {
+        // No server to cancel on, and dropping the future mid-transaction
+        // would leave the session in an unknown state — run to completion.
+        let conn = self.conn.as_mut().ok_or_else(|| anyhow!("transaction already ended"))?;
+        run_on_conn(conn, sql).await
+    }
+
+    async fn commit(&mut self) -> Result<()> {
+        let mut conn = self.conn.take().ok_or_else(|| anyhow!("transaction already ended"))?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(())
+    }
+
+    async fn rollback(&mut self) -> Result<()> {
+        let mut conn = self.conn.take().ok_or_else(|| anyhow!("transaction already ended"))?;
+        sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+        Ok(())
     }
 }
 
@@ -306,6 +351,16 @@ impl Driver for SqliteDriver {
         let mut conn = self.pool.acquire().await?;
         let sets = self.run_on_conn(&mut conn, sql).await?;
         Ok(super::collapse_sets(sets))
+    }
+
+    fn supports_tx_sessions(&self) -> bool {
+        true
+    }
+
+    async fn begin_tx(&self) -> Result<Box<dyn super::TxSession>> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        Ok(Box::new(SqliteTxSession { conn: Some(conn) }))
     }
 
     async fn query_script(

@@ -4,6 +4,7 @@ pub mod compare_tab;
 pub mod datasync_tab;
 pub mod completion_popup;
 pub mod diagram_canvas;
+pub mod diagram_svg;
 pub mod diagram_tab;
 pub mod import_export;
 pub mod query_tab;
@@ -195,6 +196,26 @@ pub struct QueryTab {
     pub find_index: usize,
     /// Focus the find field next frame.
     pub find_focus: bool,
+    // Manual-commit (transaction) mode.
+    /// Runs go through a dedicated transaction session until Commit/Rollback.
+    pub manual_commit: bool,
+    /// A manual transaction is open on the runtime side.
+    pub tx_open: bool,
+    /// A begin/commit/rollback is in flight.
+    pub tx_busy: bool,
+    /// Statements run inside the current transaction.
+    pub tx_statements: usize,
+    /// SQL waiting for the transaction to open (begin-then-run flow).
+    pub pending_tx_sql: Option<String>,
+    // Find-in-results bar (Ctrl+Shift+F, over the grid).
+    pub grid_find_open: bool,
+    pub grid_find_text: String,
+    pub grid_find_index: usize,
+    /// Focus the grid-find field next frame.
+    pub grid_find_focus: bool,
+    /// Cached matches: (needle_lower, result_idx) → cell coordinates.
+    /// Cleared whenever `results` is replaced.
+    pub grid_find_cache: Option<(String, usize, Vec<(usize, usize)>)>,
     /// Set when the last run was a single-table SELECT with its PK in the
     /// projection — the grid then allows in-place cell edits.
     pub editable: Option<EditableMeta>,
@@ -259,6 +280,16 @@ impl QueryTab {
             replace_text: String::new(),
             find_index: 0,
             find_focus: false,
+            manual_commit: false,
+            tx_open: false,
+            tx_busy: false,
+            tx_statements: 0,
+            pending_tx_sql: None,
+            grid_find_open: false,
+            grid_find_text: String::new(),
+            grid_find_index: 0,
+            grid_find_focus: false,
+            grid_find_cache: None,
             editable: None,
             grid_edit: None,
             last_executed_sql: None,
