@@ -216,6 +216,9 @@ pub struct QueryTab {
     /// Cached matches: (needle_lower, result_idx) → cell coordinates.
     /// Cleared whenever `results` is replaced.
     pub grid_find_cache: Option<(String, usize, Vec<(usize, usize)>)>,
+    /// In-memory sort of each result set (result_idx → sort keys, primary
+    /// first). Cleared whenever `results` is replaced.
+    pub grid_sort: std::collections::BTreeMap<usize, Vec<(usize, bool)>>,
     /// Set when the last run was a single-table SELECT with its PK in the
     /// projection — the grid then allows in-place cell edits.
     pub editable: Option<EditableMeta>,
@@ -290,6 +293,7 @@ impl QueryTab {
             grid_find_index: 0,
             grid_find_focus: false,
             grid_find_cache: None,
+            grid_sort: Default::default(),
             editable: None,
             grid_edit: None,
             last_executed_sql: None,
@@ -361,8 +365,11 @@ pub struct TableEditorTab {
     pub applied_filter: String,
     /// Per-column quick filters (header row); identifiers are auto-quoted.
     pub col_filters: BTreeMap<String, String>,
-    /// Active sort: (column, descending).
-    pub sort: Option<(String, bool)>,
+    /// Active sorts, primary first: (column, descending).
+    pub sort: Vec<(String, bool)>,
+    /// COUNT(*) matching the applied filter, for "rows X–Y of N". None while
+    /// unknown or being recounted.
+    pub total_rows: Option<i64>,
     /// Outgoing FKs of this table (from connection metadata), for
     /// "go to referenced row" navigation.
     pub fks: Vec<crate::db::ForeignKey>,

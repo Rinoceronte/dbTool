@@ -392,16 +392,25 @@ impl Driver for SqliteDriver {
         if !filter.where_clause.trim().is_empty() {
             sql.push_str(&format!(" WHERE {}", filter.where_clause.trim()));
         }
-        if let Some(col) = &filter.order_col {
-            sql.push_str(&format!(
-                " ORDER BY {} {}",
-                ident(col),
-                if filter.order_desc { "DESC" } else { "ASC" }
-            ));
+        if let Some(order) = filter.order_by_list(ident) {
+            sql.push_str(&format!(" ORDER BY {order}"));
         }
         sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         Ok(result_set_from_rows(rows))
+    }
+
+    async fn count_table_rows(
+        &self,
+        schema: &str,
+        table: &str,
+        filter: &RowsFilter,
+    ) -> Result<i64> {
+        let mut sql = format!("SELECT COUNT(*) FROM {}.{}", ident(schema), ident(table));
+        if !filter.where_clause.trim().is_empty() {
+            sql.push_str(&format!(" WHERE {}", filter.where_clause.trim()));
+        }
+        Ok(sqlx::query_scalar(&sql).fetch_one(&self.pool).await?)
     }
 
     async fn update_row(

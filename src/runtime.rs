@@ -45,6 +45,14 @@ pub enum Command {
         offset: i64,
         filter: RowsFilter,
     },
+    /// COUNT(*) matching a table tab's filter, for the "rows X–Y of N" label.
+    CountTableRows {
+        req: RequestId,
+        conn: ConnectionId,
+        schema: String,
+        table: String,
+        filter: RowsFilter,
+    },
     InsertRow {
         req: RequestId,
         conn: ConnectionId,
@@ -201,6 +209,7 @@ pub enum Event {
         table: String,
         result: ResultSet,
     },
+    TableRowCount { req: RequestId, total: i64 },
     RowInserted { req: RequestId },
     ChangesApplied { req: RequestId },
     StructureDescribed { req: RequestId, structure: TableStructure },
@@ -851,6 +860,16 @@ async fn handle_command(
                     &ctx,
                     Event::TableRows { req, conn, schema, table, result },
                 ),
+                Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
+            }
+        }
+
+        Command::CountTableRows { req, conn, schema, table, filter } => {
+            let Some(driver) = get_driver(&connections, conn).await else {
+                return send(&evt_tx, &ctx, Event::Error { req, error: "connection not found".into() });
+            };
+            match driver.count_table_rows(&schema, &table, &filter).await {
+                Ok(total) => send(&evt_tx, &ctx, Event::TableRowCount { req, total }),
                 Err(e) => send(&evt_tx, &ctx, Event::Error { req, error: format!("{e:#}") }),
             }
         }

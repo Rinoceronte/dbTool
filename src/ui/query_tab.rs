@@ -531,10 +531,17 @@ pub fn draw(
         let find = draw_grid_find_bar(ui, tab, idx);
         // Salt with the tab id AND result index so each set's ScrollArea/Table
         // state stays independent.
+        let sort_keys = tab.grid_sort.get(&idx).cloned().unwrap_or_default();
         let grid_action = ui
             .push_id(("results_grid", tab.id, idx), |ui| {
                 let edit = if can_edit { Some(&mut tab.grid_edit) } else { None };
-                super::results_grid::draw_with_find(ui, &tab.results[idx], edit, find.as_ref())
+                super::results_grid::draw_with_find(
+                    ui,
+                    &tab.results[idx],
+                    edit,
+                    find.as_ref(),
+                    Some(&sort_keys),
+                )
             })
             .inner;
         match grid_action {
@@ -550,6 +557,32 @@ pub fn draw(
             super::results_grid::GridAction::OpenFind => {
                 tab.grid_find_open = true;
                 tab.grid_find_focus = true;
+            }
+            super::results_grid::GridAction::SortColumn { col, additive } => {
+                // Same cycle as the table editor: asc → desc → removed; plain
+                // click replaces the sort, shift-click stacks a secondary key.
+                let keys = tab.grid_sort.entry(idx).or_default();
+                let existing = keys.iter().position(|(c, _)| *c == col);
+                if additive {
+                    match existing {
+                        Some(i) if !keys[i].1 => keys[i].1 = true,
+                        Some(i) => {
+                            keys.remove(i);
+                        }
+                        None => keys.push((col, false)),
+                    }
+                } else {
+                    *keys = match existing {
+                        Some(_) if keys.len() == 1 && !keys[0].1 => vec![(col, true)],
+                        Some(_) if keys.len() == 1 => Vec::new(),
+                        _ => vec![(col, false)],
+                    };
+                }
+                let keys = keys.clone();
+                super::results_grid::sort_rows(&mut tab.results[idx].rows, &keys);
+                // Row order changed under any in-flight edit or find match.
+                tab.grid_edit = None;
+                tab.grid_find_cache = None;
             }
             super::results_grid::GridAction::None => {}
         }

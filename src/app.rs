@@ -39,6 +39,8 @@ enum Pending {
     /// A commit/rollback of a query tab's manual transaction.
     TxEnd(TabId),
     TableRows(TabId),
+    /// COUNT(*) for a table tab's "rows X–Y of N" label; errors are ignored.
+    TableRowCount(TabId),
     /// Row fetch for the FK-peek popup.
     FkPeek,
     /// Row fetch for the FK hover preview.
@@ -107,6 +109,7 @@ pub struct App {
     auth: AuthState,
     settings: Settings,
     settings_open: bool,
+    shortcuts_open: bool,
     /// Whether the OS window had focus this frame (desktop notifications).
     window_focused: bool,
     dump_dialog: Option<DumpState>,
@@ -261,6 +264,7 @@ impl App {
             auth: AuthState::default(),
             settings,
             settings_open: false,
+            shortcuts_open: false,
             window_focused: true,
             dump_dialog: None,
             backup_dialog: None,
@@ -776,6 +780,7 @@ impl App {
                         t.status = TabStatus::Info(info);
                         t.grid_edit = None;
                         t.grid_find_cache = None;
+                        t.grid_sort.clear();
                         if t.tx_open {
                             t.tx_statements += 1;
                         }
@@ -844,6 +849,13 @@ impl App {
                         }
                     }
                     _ => {}
+                }
+            }
+            Event::TableRowCount { req, total } => {
+                if let Some(Pending::TableRowCount(tab_id)) = self.pending.remove(&req) {
+                    if let Some(Tab::TableEditor(t)) = self.find_tab_mut(tab_id) {
+                        t.total_rows = Some(total);
+                    }
                 }
             }
             Event::RowInserted { req } => {
@@ -1398,6 +1410,9 @@ impl App {
                             t.status = TabStatus::Error(error);
                         }
                     }
+                    // A failed count only means the label stays plain — the
+                    // row fetch itself reports any real problem.
+                    Some(Pending::TableRowCount(_)) => {}
                     Some(Pending::TableRows(tab_id))
                     | Some(Pending::RowInsert(tab_id))
                     | Some(Pending::ApplyChanges(tab_id))
@@ -1629,6 +1644,26 @@ impl App {
             table,
             limit,
             offset,
+            filter,
+        });
+        self.request_table_count(tab_id);
+    }
+
+    /// Re-count the rows matching a table tab's applied filter for the
+    /// "rows X–Y of N" label. Fire-and-forget: errors leave the label plain.
+    fn request_table_count(&mut self, tab_id: TabId) {
+        let (conn_id, schema, table, filter) = match self.find_tab_mut(tab_id) {
+            Some(Tab::TableEditor(t)) => {
+                t.total_rows = None;
+                (t.conn_id, t.schema.clone(), t.table.clone(), table_rows_filter(t))
+            }
+            _ => return,
+        };
+        self.send(Pending::TableRowCount(tab_id), move |req| Command::CountTableRows {
+            req,
+            conn: conn_id,
+            schema,
+            table,
             filter,
         });
     }
@@ -2428,7 +2463,8 @@ impl App {
             limit: 1000,
             filter: filter.clone(),
             applied_filter: filter.clone(),
-            sort: None,
+            sort: Vec::new(),
+            total_rows: None,
             col_filters: BTreeMap::new(),
             fks,
             edit: None,
@@ -2455,8 +2491,7 @@ impl App {
         let table_r = table.clone();
         let rows_filter = crate::db::RowsFilter {
             where_clause: filter,
-            order_col: None,
-            order_desc: false,
+            order: Vec::new(),
         };
         self.send(Pending::TableRows(id), move |req| Command::FetchTableRows {
             req,
@@ -2467,6 +2502,7 @@ impl App {
             offset: 0,
             filter: rows_filter,
         });
+        self.request_table_count(id);
     }
 
     fn open_new_table_tab(&mut self, conn_id: ConnectionId, schema: String) {
@@ -2497,7 +2533,8 @@ impl App {
             limit: 1000,
             filter: String::new(),
             applied_filter: String::new(),
-            sort: None,
+            sort: Vec::new(),
+            total_rows: None,
             col_filters: BTreeMap::new(),
             fks: Vec::new(),
             edit: None,
@@ -2961,8 +2998,7 @@ impl App {
         });
         let rows_filter = crate::db::RowsFilter {
             where_clause: filter,
-            order_col: None,
-            order_desc: false,
+            order: Vec::new(),
         };
         self.send(Pending::FkPeek, move |req| Command::FetchTableRows {
             req,
@@ -3924,8 +3960,7 @@ impl App {
             let table = h.table.clone();
             let filter = crate::db::RowsFilter {
                 where_clause: h.filter.clone(),
-                order_col: None,
-                order_desc: false,
+                order: Vec::new(),
             };
             let mut sent = None;
             self.send(Pending::FkHover, |req| {
@@ -4129,6 +4164,87 @@ impl App {
 
     /// Query-history popup: searchable, newest first; Insert puts the SQL
     /// into the active (or first) query tab.
+    fn draw_shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        const GROUPS: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Global",
+                &[
+                    ("Ctrl+P", "Search everywhere (tables, columns, routines)"),
+                    ("F1", "Toggle this window"),
+                ],
+            ),
+            (
+                "Query editor",
+                &[
+                    ("Ctrl+Enter", "Run the query (or just the selection)"),
+                    ("Ctrl+Space", "Autocomplete"),
+                    ("Ctrl+F", "Find / replace in the editor"),
+                    ("Ctrl+Shift+F", "Find in results"),
+                    ("Ctrl+S", "Save to a .sql file"),
+                ],
+            ),
+            (
+                "Completion popup",
+                &[
+                    ("↑ ↓  PgUp PgDn", "Move through suggestions"),
+                    ("Enter / Tab", "Accept"),
+                    ("Esc", "Dismiss"),
+                ],
+            ),
+            (
+                "Results & data grids",
+                &[
+                    ("Click header", "Sort by column (asc → desc → off)"),
+                    ("Shift+click header", "Add column to the sort"),
+                    ("Double-click cell", "Edit in place (editable grids)"),
+                    ("Enter / Esc", "Commit / cancel the cell edit"),
+                    ("Right-click", "Copy as CSV / INSERT / JSON, column stats…"),
+                ],
+            ),
+            (
+                "Table Data tab",
+                &[
+                    ("Enter in a filter box", "Apply the filter"),
+                    ("Ctrl+click / Shift+click #", "Toggle / range-select rows"),
+                ],
+            ),
+            ("Structure editor", &[("Ctrl+Enter", "Apply pending DDL changes")]),
+            ("Diagrams", &[("Ctrl+S", "Save the .dbml file")]),
+            (
+                "AI panel",
+                &[("Enter", "Send"), ("Shift+Enter", "New line")],
+            ),
+        ];
+        let mut open = self.shortcuts_open;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
+                    for (title, rows) in GROUPS {
+                        ui.label(egui::RichText::new(*title).strong());
+                        egui::Grid::new(("shortcuts", title))
+                            .num_columns(2)
+                            .spacing([18.0, 4.0])
+                            .show(ui, |ui| {
+                                for (keys, what) in *rows {
+                                    ui.monospace(*keys);
+                                    ui.label(*what);
+                                    ui.end_row();
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                });
+            });
+        self.shortcuts_open = open;
+    }
+
     fn draw_history_window(
         &mut self,
         ctx: &egui::Context,
@@ -4452,6 +4568,13 @@ impl eframe::App for App {
                         {
                             self.settings_open = !self.settings_open;
                         }
+                        if ui
+                            .selectable_label(self.shortcuts_open, "⌨")
+                            .on_hover_text("Keyboard shortcuts (F1)")
+                            .clicked()
+                        {
+                            self.shortcuts_open = !self.shortcuts_open;
+                        }
                         if let Some(info) = self.update_banner.clone() {
                             ui.separator();
                             if self.update_downloading {
@@ -4622,6 +4745,11 @@ impl eframe::App for App {
         if self.palette_open {
             self.draw_palette(ctx);
         }
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.shortcuts_open = !self.shortcuts_open;
+        }
+        self.draw_shortcuts_window(ctx);
 
         self.draw_cell_viewer(ctx);
         self.draw_fk_peek(ctx);
@@ -5310,6 +5438,7 @@ fn handle_table_editor_action(
                     offset,
                     filter,
                 });
+                app.request_table_count(tab_id);
             }));
         }
         A::PrevPage => {
@@ -5612,8 +5741,7 @@ fn table_rows_filter(tab: &TableEditorTab) -> crate::db::RowsFilter {
     }
     crate::db::RowsFilter {
         where_clause: conds.join(" AND "),
-        order_col: tab.sort.as_ref().map(|(c, _)| c.clone()),
-        order_desc: tab.sort.as_ref().map(|(_, d)| *d).unwrap_or(false),
+        order: tab.sort.clone(),
     }
 }
 

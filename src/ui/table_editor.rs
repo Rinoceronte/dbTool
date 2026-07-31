@@ -155,12 +155,15 @@ pub fn draw(
             action = TableEditorAction::PrevPage;
         }
         let end = tab.offset + row_n;
-        ui.label(
-            egui::RichText::new(format!("rows {}–{}", tab.offset + 1, end.max(tab.offset)))
-                .color(ui.visuals().weak_text_color()),
-        );
+        let range = format!("rows {}–{}", tab.offset + 1, end.max(tab.offset));
+        let label = match tab.total_rows {
+            Some(total) => format!("{range} of {}", thousands(total)),
+            None => range,
+        };
+        ui.label(egui::RichText::new(label).color(ui.visuals().weak_text_color()));
+        let more = row_n >= tab.limit && tab.total_rows.map_or(true, |t| end < t);
         if ui
-            .add_enabled(row_n >= tab.limit, egui::Button::new("Next ▶"))
+            .add_enabled(more, egui::Button::new("Next ▶"))
             .on_hover_text("Next page")
             .clicked()
         {
@@ -192,11 +195,17 @@ pub fn draw(
             tab.col_filters.clear();
             action = TableEditorAction::ApplyFilter;
         }
-        if let Some((col, desc)) = &tab.sort {
+        if !tab.sort.is_empty() {
             ui.separator();
-            ui.weak(format!("sorted by {col} {}", if *desc { "▼" } else { "▲" }));
+            let cols = tab
+                .sort
+                .iter()
+                .map(|(col, desc)| format!("{col} {}", if *desc { "▼" } else { "▲" }))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.weak(format!("sorted by {cols}"));
             if ui.small_button("✖").on_hover_text("Clear sort").clicked() {
-                tab.sort = None;
+                tab.sort.clear();
                 action = TableEditorAction::ApplyFilter;
             }
         }
@@ -242,7 +251,7 @@ pub fn draw(
     let mut begin_edit: Option<CellEdit> = None;
     let mut cancel_edit = false;
     let mut click_select: Option<(usize, egui::Modifiers)> = None;
-    let mut sort_click: Option<String> = None;
+    let mut sort_click: Option<(String, bool)> = None;
     let mut filter_apply = false;
     let mut ctx_action: Option<TableEditorAction> = None;
     let mut fk_hover: Option<super::FkHoverCell> = None;
@@ -292,10 +301,14 @@ pub fn draw(
                         } else {
                             c.name.clone()
                         };
-                        match &current_sort {
-                            Some((col, false)) if col == &c.name => label.push_str(" ▲"),
-                            Some((col, true)) if col == &c.name => label.push_str(" ▼"),
-                            _ => {}
+                        if let Some(pos) =
+                            current_sort.iter().position(|(col, _)| col == &c.name)
+                        {
+                            let arrow = if current_sort[pos].1 { "▼" } else { "▲" };
+                            label.push_str(&format!(" {arrow}"));
+                            if current_sort.len() > 1 {
+                                label.push_str(&(pos + 1).to_string());
+                            }
                         }
                         let resp = ui.add(
                             egui::Label::new(egui::RichText::new(label).strong())
@@ -304,10 +317,14 @@ pub fn draw(
                                 .sense(egui::Sense::click()),
                         );
                         if resp
-                            .on_hover_text(format!("{} — click to sort", c.type_name))
+                            .on_hover_text(format!(
+                                "{} — click to sort, shift-click to add to sort",
+                                c.type_name
+                            ))
                             .clicked()
                         {
-                            sort_click = Some(c.name.clone());
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            sort_click = Some((c.name.clone(), shift));
                         }
                         // Per-column quick filter; the column name is quoted
                         // when building SQL, so case-sensitive names work.
@@ -528,13 +545,26 @@ pub fn draw(
             .or_default()
             .insert(column, new_value);
     }
-    if let Some(col) = sort_click {
-        // Cycle: unsorted → ascending → descending → unsorted.
-        tab.sort = match &tab.sort {
-            Some((c, false)) if c == &col => Some((col, true)),
-            Some((c, true)) if c == &col => None,
-            _ => Some((col, false)),
-        };
+    if let Some((col, additive)) = sort_click {
+        // Cycle the clicked column: ascending → descending → removed. A plain
+        // click replaces the whole sort; shift-click stacks the column onto
+        // the existing sort as a secondary key.
+        let existing = tab.sort.iter().position(|(c, _)| c == &col);
+        if additive {
+            match existing {
+                Some(i) if !tab.sort[i].1 => tab.sort[i].1 = true,
+                Some(i) => {
+                    tab.sort.remove(i);
+                }
+                None => tab.sort.push((col, false)),
+            }
+        } else {
+            tab.sort = match existing {
+                Some(_) if tab.sort.len() == 1 && !tab.sort[0].1 => vec![(col, true)],
+                Some(_) if tab.sort.len() == 1 => Vec::new(),
+                _ => vec![(col, false)],
+            };
+        }
         action = TableEditorAction::ApplyFilter;
     }
     if filter_apply {
@@ -546,6 +576,22 @@ pub fn draw(
     *hover_fk = fk_hover;
 
     action
+}
+
+/// 1234567 → "1,234,567".
+fn thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn apply_selection_click(tab: &mut TableEditorTab, idx: usize, mods: egui::Modifiers) {

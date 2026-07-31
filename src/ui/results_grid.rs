@@ -16,6 +16,9 @@ pub enum GridAction {
     DeleteRow { row: usize },
     /// Open the find-in-results bar (query tabs only; ignored elsewhere).
     OpenFind,
+    /// Header click on a sortable grid: sort in memory by this column.
+    /// `additive` (shift-click) stacks the column onto the existing sort.
+    SortColumn { col: usize, additive: bool },
 }
 
 /// Find-in-results state for one frame of grid drawing.
@@ -32,6 +35,41 @@ pub struct GridFind {
 /// Case-insensitive substring test against the value's display text.
 pub fn cell_matches(v: &Value, query_lower: &str) -> bool {
     !matches!(v, Value::Null) && v.display().to_lowercase().contains(query_lower)
+}
+
+/// Ascending order across value kinds: numbers numerically, everything else
+/// by display text, NULLs last (reversed wholesale for DESC, so NULLs come
+/// first there — same as Postgres).
+pub fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (Value::Null, Value::Null) => Equal,
+        (Value::Null, _) => Greater,
+        (_, Value::Null) => Less,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => a.display().cmp(&b.display()),
+    }
+}
+
+/// Sort rows in place by the given (column, descending) keys, primary first.
+pub fn sort_rows(rows: &mut [Vec<Value>], keys: &[(usize, bool)]) {
+    let null = Value::Null;
+    rows.sort_by(|ra, rb| {
+        for (col, desc) in keys {
+            let a = ra.get(*col).unwrap_or(&null);
+            let b = rb.get(*col).unwrap_or(&null);
+            let ord = value_cmp(a, b);
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
 }
 
 /// How many bytes of a binary value the hex dump renders.
@@ -340,7 +378,7 @@ fn column_stats(result: &ResultSet, col: usize) -> String {
 }
 
 pub fn draw(ui: &mut egui::Ui, result: &ResultSet) -> GridAction {
-    draw_impl(ui, result, None, None)
+    draw_impl(ui, result, None, None, None)
 }
 
 /// Grid with in-place cell editing (single-table SELECTs whose PK is in the
@@ -350,17 +388,19 @@ pub fn draw_editable(
     result: &ResultSet,
     edit: &mut Option<super::CellEdit>,
 ) -> GridAction {
-    draw_impl(ui, result, Some(edit), None)
+    draw_impl(ui, result, Some(edit), None, None)
 }
 
-/// Grid with optional editing and find-in-results highlighting.
+/// Grid with optional editing, find-in-results highlighting, and — when
+/// `sort` is Some — click-to-sort headers showing the active sort keys.
 pub fn draw_with_find(
     ui: &mut egui::Ui,
     result: &ResultSet,
     edit: Option<&mut Option<super::CellEdit>>,
     find: Option<&GridFind>,
+    sort: Option<&[(usize, bool)]>,
 ) -> GridAction {
-    draw_impl(ui, result, edit, find)
+    draw_impl(ui, result, edit, find, sort)
 }
 
 fn draw_impl(
@@ -368,6 +408,7 @@ fn draw_impl(
     result: &ResultSet,
     mut edit: Option<&mut Option<super::CellEdit>>,
     find: Option<&GridFind>,
+    sort: Option<&[(usize, bool)]>,
 ) -> GridAction {
     let mut action = GridAction::None;
     if let Some(n) = result.rows_affected {
@@ -441,16 +482,38 @@ fn draw_impl(
                     });
                     for (ci, c) in result.columns.iter().enumerate() {
                         h.col(|ui| {
+                            let mut label = c.name.clone();
+                            let keys = sort.unwrap_or(&[]);
+                            if let Some(pos) = keys.iter().position(|(col, _)| *col == ci) {
+                                let arrow = if keys[pos].1 { "▼" } else { "▲" };
+                                label.push_str(&format!(" {arrow}"));
+                                if keys.len() > 1 {
+                                    label.push_str(&(pos + 1).to_string());
+                                }
+                            }
+                            let hover = if sort.is_some() {
+                                format!(
+                                    "{} · {} — click to sort, shift-click to add \
+                                     to sort, right-click for column stats",
+                                    c.name, c.type_name
+                                )
+                            } else {
+                                format!(
+                                    "{} · {} — right-click for column stats",
+                                    c.name, c.type_name
+                                )
+                            };
                             let resp = ui
                                 .add(
-                                    egui::Label::new(egui::RichText::new(&c.name).strong())
+                                    egui::Label::new(egui::RichText::new(label).strong())
                                         .truncate()
                                         .sense(egui::Sense::click()),
                                 )
-                                .on_hover_text(format!(
-                                    "{} · {} — right-click for column stats",
-                                    c.name, c.type_name
-                                ));
+                                .on_hover_text(hover);
+                            if sort.is_some() && resp.clicked() {
+                                let additive = ui.input(|i| i.modifiers.shift);
+                                action = GridAction::SortColumn { col: ci, additive };
+                            }
                             resp.context_menu(|ui| {
                                 if ui.button("Column stats").clicked() {
                                     action = GridAction::ViewCell {

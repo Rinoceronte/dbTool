@@ -141,17 +141,35 @@ pub type PkValues = BTreeMap<String, Value>;
 pub type RowChanges = BTreeMap<String, Value>;
 
 /// User-driven narrowing of a table data page: an optional raw WHERE clause
-/// (written by the user, passed through verbatim) and an optional sort column.
+/// (written by the user, passed through verbatim) and sort columns applied
+/// in order, primary first.
 #[derive(Debug, Clone, Default)]
 pub struct RowsFilter {
     pub where_clause: String,
-    pub order_col: Option<String>,
-    pub order_desc: bool,
+    /// (column, descending) pairs, primary first.
+    pub order: Vec<(String, bool)>,
 }
 
 impl RowsFilter {
     pub fn is_empty(&self) -> bool {
-        self.where_clause.trim().is_empty() && self.order_col.is_none()
+        self.where_clause.trim().is_empty() && self.order.is_empty()
+    }
+
+    /// The ORDER BY column list ("a ASC, b DESC") with each identifier quoted
+    /// by the driver's `ident`, or None when no sort is active.
+    pub fn order_by_list(&self, ident: impl Fn(&str) -> String) -> Option<String> {
+        if self.order.is_empty() {
+            return None;
+        }
+        Some(
+            self.order
+                .iter()
+                .map(|(c, desc)| {
+                    format!("{} {}", ident(c), if *desc { "DESC" } else { "ASC" })
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 }
 

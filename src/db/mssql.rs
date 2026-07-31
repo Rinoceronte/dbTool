@@ -557,12 +557,8 @@ impl Driver for MsSqlDriver {
         } else {
             format!(" WHERE {}", filter.where_clause.trim())
         };
-        let order_sql = match &filter.order_col {
-            Some(col) => format!(
-                "ORDER BY {} {}",
-                ident(col),
-                if filter.order_desc { "DESC" } else { "ASC" }
-            ),
+        let order_sql = match filter.order_by_list(ident) {
+            Some(order) => format!("ORDER BY {order}"),
             None => "ORDER BY (SELECT NULL)".to_owned(),
         };
         let sql = format!(
@@ -582,6 +578,27 @@ impl Driver for MsSqlDriver {
             rs.columns = meta;
         }
         Ok(rs)
+    }
+
+    async fn count_table_rows(
+        &self,
+        schema: &str,
+        table: &str,
+        filter: &RowsFilter,
+    ) -> Result<i64> {
+        let mut sql = format!(
+            "SELECT COUNT_BIG(*) FROM {}.{}",
+            ident(schema),
+            ident(table)
+        );
+        if !filter.where_clause.trim().is_empty() {
+            sql.push_str(&format!(" WHERE {}", filter.where_clause.trim()));
+        }
+        let mut client = self.client.lock().await;
+        let rows = client.simple_query(sql).await?.into_first_result().await?;
+        rows.first()
+            .and_then(|r| r.try_get::<i64, _>(0).ok().flatten())
+            .ok_or_else(|| anyhow!("COUNT_BIG returned no value"))
     }
 
     async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects> {

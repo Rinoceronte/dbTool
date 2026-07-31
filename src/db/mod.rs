@@ -99,6 +99,13 @@ pub trait Driver: Send + Sync {
         offset: i64,
         filter: &RowsFilter,
     ) -> Result<ResultSet>;
+    /// COUNT(*) over the table with the filter's WHERE applied (sort ignored).
+    async fn count_table_rows(
+        &self,
+        schema: &str,
+        table: &str,
+        filter: &RowsFilter,
+    ) -> Result<i64>;
     async fn update_row(
         &self,
         schema: &str,
