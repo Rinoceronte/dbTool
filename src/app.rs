@@ -4173,6 +4173,7 @@ impl App {
                 "Global",
                 &[
                     ("Ctrl+P", "Search everywhere (tables, columns, routines)"),
+                    ("Type over the sidebar", "Filter tables (Esc or 10 s idle clears)"),
                     ("F1", "Toggle this window"),
                 ],
             ),

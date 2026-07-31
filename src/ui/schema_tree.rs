@@ -51,9 +51,12 @@ pub enum TreeAction {
 }
 
 /// The schema/table tree for one connected connection; the connection card
-/// above it is the header (name, badge, actions).
-pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection) -> TreeAction {
+/// above it is the header (name, badge, actions). `filter` is the sidebar's
+/// live table filter, already trimmed and lowercased; non-empty forces
+/// schemas open, hides non-matching tables, and skips matchless schemas.
+pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection, filter: &str) -> TreeAction {
     let mut action = TreeAction::None;
+    let filtering = !filter.is_empty();
 
     {
         if !conn.schemas_loaded {
@@ -72,13 +75,28 @@ pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection) -> TreeAction {
         }
 
         for schema in conn.schemas.iter_mut() {
+            // A filter hit on the schema name shows the whole schema.
+            let schema_hit = filtering && schema.name.to_lowercase().contains(filter);
+            let matches = match (&schema.tables, filtering && !schema_hit) {
+                (Some(t), true) => {
+                    Some(t.iter().filter(|t| t.name.to_lowercase().contains(filter)).count())
+                }
+                _ => None,
+            };
+            if matches == Some(0) {
+                continue;
+            }
             let id = ui.make_persistent_id(format!("schema_{}_{}", conn.conn_id, schema.name));
-            let count_hint = match &schema.tables {
-                Some(t) => format!(" ({})", t.len()),
-                None => String::new(),
+            let count_hint = match (&schema.tables, matches) {
+                (Some(t), Some(m)) => format!(" ({m}/{})", t.len()),
+                (Some(t), None) => format!(" ({})", t.len()),
+                (None, _) => String::new(),
             };
             let header_text = egui::RichText::new(format!("🗀 {}{}", schema.name, count_hint));
-            let header = egui::CollapsingHeader::new(header_text).id_source(id);
+            let mut header = egui::CollapsingHeader::new(header_text).id_source(id);
+            if filtering {
+                header = header.open(Some(true));
+            }
             let resp = header.show(ui, |ui| {
                 match &schema.tables {
                 None => {
@@ -92,6 +110,9 @@ pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection) -> TreeAction {
                 }
                 Some(tables) => {
                     for t in tables {
+                        if filtering && !schema_hit && !t.name.to_lowercase().contains(filter) {
+                            continue;
+                        }
                         let (icon, hover) = match t.kind {
                             crate::db::TableKind::Table => ("▦", "Table — double-click to open"),
                             crate::db::TableKind::View => ("◈", "View — double-click to open"),
@@ -187,13 +208,16 @@ pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection) -> TreeAction {
                     }
                 }
                 }
-                draw_schema_objects(
-                    ui,
-                    conn.conn_id,
-                    &schema.name,
-                    schema.objects.as_ref(),
-                    &mut action,
-                );
+                // Object sections are noise while table-filtering.
+                if !filtering {
+                    draw_schema_objects(
+                        ui,
+                        conn.conn_id,
+                        &schema.name,
+                        schema.objects.as_ref(),
+                        &mut action,
+                    );
+                }
             });
             resp.header_response.context_menu(|ui| {
                 if ui.button("New table…").clicked() {

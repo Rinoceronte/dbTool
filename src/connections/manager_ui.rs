@@ -15,6 +15,16 @@ pub struct ManagerState {
     /// Databases highlighted via ctrl+click for a structure compare (max 2,
     /// oldest dropped first).
     pub compare_selection: Vec<ConnectionId>,
+    /// Live table filter, scoped to one database subtree: typing while the
+    /// pointer is over a tree (with nothing else focused) starts/extends it;
+    /// there is no input widget — Esc or 10 s without a keystroke clears it.
+    pub tree_filter: String,
+    /// The database connection the filter applies to (the one hovered when
+    /// typing started).
+    pub tree_filter_conn: Option<ConnectionId>,
+    /// `ui.input(|i| i.time)` of the last filter keystroke, for the
+    /// idle auto-clear.
+    pub tree_filter_at: f64,
 }
 
 /// Toggle a database in the compare selection, keeping at most two.
@@ -140,6 +150,74 @@ pub fn draw_connection_list(
     });
     ui.add_space(4.0);
 
+    // Filters die with their connection.
+    if state
+        .tree_filter_conn
+        .is_some_and(|c| !active.iter().any(|a| a.conn_id == c))
+    {
+        state.tree_filter.clear();
+        state.tree_filter_conn = None;
+    }
+
+    if !active.is_empty() {
+        // Typing while the pointer is over one database's subtree (with no
+        // other field focused) filters just that tree — no input widget.
+        // Backspace edits, Esc clears, and 10 s idle clears on its own.
+        // Subtree rects are cached from last frame's draw.
+        let hovered_conn = ui.ctx().pointer_latest_pos().and_then(|p| {
+            active.iter().find_map(|a| {
+                ui.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("tree_rect", a.conn_id))))
+                    .filter(|r| r.contains(p))
+                    .map(|_| a.conn_id)
+            })
+        });
+        if hovered_conn.is_some() && ui.ctx().memory(|m| m.focused().is_none()) {
+            let (typed, backspace, esc, now) = ui.input(|i| {
+                let t: String = i
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                (
+                    t,
+                    i.key_pressed(egui::Key::Backspace),
+                    i.key_pressed(egui::Key::Escape),
+                    i.time,
+                )
+            });
+            if esc {
+                state.tree_filter.clear();
+                state.tree_filter_conn = None;
+            } else if backspace || !typed.is_empty() {
+                // Typing over a different tree moves the filter there.
+                if state.tree_filter_conn != hovered_conn {
+                    state.tree_filter.clear();
+                    state.tree_filter_conn = hovered_conn;
+                }
+                if backspace {
+                    state.tree_filter.pop();
+                }
+                state.tree_filter.push_str(&typed);
+                state.tree_filter_at = now;
+            }
+        }
+        // No filter UI at all — the (matches/total) schema counts are the
+        // only sign it's active; 10 s idle (or Esc) restores the full tree.
+        if !state.tree_filter.is_empty() {
+            let now = ui.input(|i| i.time);
+            if now - state.tree_filter_at > 10.0 {
+                state.tree_filter.clear();
+                state.tree_filter_conn = None;
+            } else {
+                // Keep frames coming so the idle clear fires without input.
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+
     if profiles.is_empty() {
         ui.add_space(8.0);
         ui.vertical_centered(|ui| {
@@ -152,6 +230,8 @@ pub fn draw_connection_list(
         return (action, tree_action);
     }
 
+    let flt = state.tree_filter.trim().to_lowercase();
+    let flt_conn = state.tree_filter_conn;
     for profile in profiles {
         let primary_conn = active
             .iter()
@@ -174,6 +254,9 @@ pub fn draw_connection_list(
                     // the whole subtree (header + expanded schemas/tables).
                     let wash_idx = ui.painter().add(egui::Shape::Noop);
                     let node_top = ui.next_widget_position().y;
+                    // The type-to-filter only applies to the hovered subtree.
+                    let conn_flt =
+                        if flt_conn == Some(conn.conn_id) { flt.as_str() } else { "" };
                     if multi {
                         // While ctrl is held, freeze the header at its current
                         // open state so ctrl+click only selects for compare
@@ -198,8 +281,11 @@ pub fn draw_connection_list(
                         if frozen_open.is_some() {
                             header = header.open(frozen_open);
                         }
+                        if !conn_flt.is_empty() {
+                            header = header.open(Some(true));
+                        }
                         let resp = header.show(ui, |ui| {
-                            let t = schema_tree::draw_tree(ui, conn);
+                            let t = schema_tree::draw_tree(ui, conn, conn_flt);
                             if !matches!(t, TreeAction::None) {
                                 tree_action = t;
                             }
@@ -238,23 +324,42 @@ pub fn draw_connection_list(
                             );
                         }
                     } else {
-                        let t = schema_tree::draw_tree(ui, conn);
+                        let t = schema_tree::draw_tree(ui, conn, conn_flt);
                         if !matches!(t, TreeAction::None) {
                             tree_action = t;
                         }
                     }
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(ui.max_rect().left(), node_top - 1.0),
+                        egui::pos2(ui.max_rect().right(), ui.min_rect().bottom() + 1.0),
+                    );
+                    // Cache the subtree's rect so next frame's type-to-filter
+                    // can tell which database the pointer is over.
+                    ui.data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("tree_rect", conn.conn_id)), rect);
+                    });
                     if let Some(c) = profile.database_color(&conn.database) {
-                        let rect = egui::Rect::from_min_max(
-                            egui::pos2(ui.max_rect().left(), node_top - 1.0),
-                            egui::pos2(ui.max_rect().right(), ui.min_rect().bottom() + 1.0),
+                        // A solid edge bar carries the color; the wash behind
+                        // the rows stays faint so text keeps its contrast no
+                        // matter which color was picked.
+                        let bar = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.left() + 3.0, rect.bottom()),
                         );
                         ui.painter().set(
                             wash_idx,
-                            egui::Shape::rect_filled(
-                                rect,
-                                egui::Rounding::same(4.0),
-                                egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 30),
-                            ),
+                            egui::Shape::Vec(vec![
+                                egui::Shape::rect_filled(
+                                    rect,
+                                    egui::Rounding::same(4.0),
+                                    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 10),
+                                ),
+                                egui::Shape::rect_filled(
+                                    bar,
+                                    egui::Rounding::same(2.0),
+                                    egui::Color32::from_rgb(c[0], c[1], c[2]),
+                                ),
+                            ]),
                         );
                     }
                 }
@@ -294,8 +399,10 @@ fn draw_conn_row(
     let pre_resp = prev_rect.map(|r| ui.interact(r, card_id, egui::Sense::click()));
 
     let fill = if is_active {
+        // Faint enough that any picker color keeps the text legible; the
+        // stroke below carries the full-strength color.
         let a = accent.to_array();
-        egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], 26)
+        egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], 10)
     } else {
         ui.visuals().faint_bg_color
     };
