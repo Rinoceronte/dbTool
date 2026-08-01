@@ -237,8 +237,21 @@ pub fn draw_connection_list(
             .iter()
             .find(|a| a.profile_id == profile.id && a.is_primary)
             .map(|a| a.conn_id);
-        draw_conn_row(ui, state, profile, primary_conn, &mut action, &mut tree_action);
-        if primary_conn.is_some() {
+        // Whole database list under the card collapses (click the card or
+        // its chevron) so busy sidebars can make room.
+        let open_id = egui::Id::new(("conn_tree_open", profile.id));
+        let mut tree_open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
+        draw_conn_row(
+            ui,
+            state,
+            profile,
+            primary_conn,
+            &mut tree_open,
+            &mut action,
+            &mut tree_action,
+        );
+        ui.data_mut(|d| d.insert_temp(open_id, tree_open));
+        if primary_conn.is_some() && tree_open {
             let mut conns: Vec<&mut ActiveConnection> = active
                 .iter_mut()
                 .filter(|a| a.profile_id == profile.id)
@@ -290,6 +303,9 @@ pub fn draw_connection_list(
                                 tree_action = t;
                             }
                         });
+                        if ui.rect_contains_pointer(resp.header_response.rect) {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
                         resp.header_response.context_menu(|ui| {
                             if ui.button("New query tab").clicked() {
                                 tree_action = TreeAction::OpenQueryTab(conn.conn_id);
@@ -378,6 +394,7 @@ fn draw_conn_row(
     state: &mut ManagerState,
     profile: &ConnectionProfile,
     primary_conn: Option<ConnectionId>,
+    tree_open: &mut bool,
     action: &mut ManagerAction,
     tree_action: &mut TreeAction,
 ) {
@@ -430,6 +447,17 @@ fn draw_conn_row(
                     profile.name.clone()
                 };
                 ui.horizontal(|ui| {
+                    if is_active {
+                        let chevron = if *tree_open { "⏷" } else { "⏵" };
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(chevron).small()).frame(false))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Collapse/expand the database list")
+                            .clicked()
+                        {
+                            *tree_open = !*tree_open;
+                        }
+                    }
                     theme::status_dot(ui, is_active)
                         .on_hover_text(if is_active { "Connected" } else { "Not connected" });
                     ui.label(egui::RichText::new(name).strong());
@@ -477,12 +505,17 @@ fn draw_conn_row(
     // right-click opens the menu. Falls back to the frame response on the
     // very first frame, before a rect is cached.
     let resp = pre_resp.unwrap_or_else(|| inner.response.interact(egui::Sense::click()));
+    if ui.rect_contains_pointer(inner.response.rect) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if resp.double_clicked() && !is_active {
         *action = ManagerAction::Connect { profile_id: profile.id };
     }
     if let Some(conn) = primary_conn {
         if resp.clicked() && ui.input(|i| i.modifiers.command) {
             toggle_compare_selection(&mut state.compare_selection, conn);
+        } else if resp.clicked() {
+            *tree_open = !*tree_open;
         }
     }
     resp.context_menu(|ui| {

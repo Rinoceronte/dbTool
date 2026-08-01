@@ -16,6 +16,13 @@ pub struct SavedQueryTab {
     pub sql: String,
     #[serde(default)]
     pub file_path: Option<PathBuf>,
+    /// Editor/results splitter position (fraction of the tab given to the editor).
+    #[serde(default = "default_editor_frac")]
+    pub editor_frac: f32,
+}
+
+pub fn default_editor_frac() -> f32 {
+    0.4
 }
 
 #[derive(Serialize, Deserialize, Default)]

@@ -436,11 +436,15 @@ pub fn draw(
                     .id_source("ai_approval_sql_scroll")
                     .max_height(220.0)
                     .show(ui, |ui| {
+                        let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                            super::layout_sql(ui, text, &[], 0)
+                        };
                         ui.add(
                             egui::TextEdit::multiline(&mut sql.as_str().to_string())
                                 .code_editor()
                                 .desired_width(f32::INFINITY)
-                                .interactive(false),
+                                .interactive(false)
+                                .layouter(&mut layouter),
                         );
                     });
                 ui.add_space(8.0);

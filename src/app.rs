@@ -110,6 +110,8 @@ pub struct App {
     settings: Settings,
     settings_open: bool,
     shortcuts_open: bool,
+    /// Fully hide the connections sidebar (☰ button, Ctrl+B).
+    sidebar_hidden: bool,
     /// Whether the OS window had focus this frame (desktop notifications).
     window_focused: bool,
     dump_dialog: Option<DumpState>,
@@ -265,6 +267,7 @@ impl App {
             settings,
             settings_open: false,
             shortcuts_open: false,
+            sidebar_hidden: false,
             window_focused: true,
             dump_dialog: None,
             backup_dialog: None,
@@ -309,6 +312,7 @@ impl App {
                 st.sql.clone(),
             );
             tab.file_path = st.file_path.clone();
+            tab.editor_frac = st.editor_frac;
             tab.status = TabStatus::Info("restored — connect the profile to run".into());
             app.tabs.push(Tab::Query(tab));
         }
@@ -4173,6 +4177,7 @@ impl App {
                 "Global",
                 &[
                     ("Ctrl+P", "Search everywhere (tables, columns, routines)"),
+                    ("Ctrl+B", "Hide / show the sidebar"),
                     ("Type over the sidebar", "Filter tables (Esc or 10 s idle clears)"),
                     ("F1", "Toggle this window"),
                 ],
@@ -4503,6 +4508,7 @@ impl eframe::App for App {
                     title: q.title.clone(),
                     sql: q.sql.clone(),
                     file_path: q.file_path.clone(),
+                    editor_frac: q.editor_frac,
                 });
             }
         }
@@ -4544,6 +4550,15 @@ impl eframe::App for App {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new("dbTool").strong().size(15.0).color(theme::ACCENT));
                     ui.separator();
+
+                    if ui
+                        .selectable_label(!self.sidebar_hidden, "☰")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Hide / show the sidebar (Ctrl+B)")
+                        .clicked()
+                    {
+                        self.sidebar_hidden = !self.sidebar_hidden;
+                    }
 
                     if ui
                         .selectable_label(self.ai_panel.open, "💬")
@@ -4750,6 +4765,9 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
             self.shortcuts_open = !self.shortcuts_open;
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::B)) {
+            self.sidebar_hidden = !self.sidebar_hidden;
+        }
         self.draw_shortcuts_window(ctx);
 
         self.draw_cell_viewer(ctx);
@@ -4757,6 +4775,7 @@ impl eframe::App for App {
         self.draw_comments_dialog(ctx);
         self.draw_history_window(ctx, &mut pending_actions);
 
+        if !self.sidebar_hidden {
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(280.0)
@@ -4780,6 +4799,7 @@ impl eframe::App for App {
                         }));
                     });
             });
+        }
 
         // 3. Status bar.
         egui::TopBottomPanel::bottom("status")

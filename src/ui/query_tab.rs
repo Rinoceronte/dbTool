@@ -227,8 +227,10 @@ pub fn draw(
     // Re-draw is triggered each frame anyway.
     let popup_action = completion_popup::draw(ui.ctx(), &mut tab.completion);
 
-    // Editor.
-    let editor_height = (ui.available_height() * 0.4).max(120.0);
+    // Editor. Height comes from the tab's draggable editor/results splitter.
+    let split_avail = ui.available_height();
+    let editor_height = (split_avail * tab.editor_frac)
+        .clamp(60.0, (split_avail - 160.0).max(60.0));
     let editor_id = egui::Id::new(("query_editor", tab.id));
 
     // Pre-typing: detect Ctrl+Space for forced popup open.
@@ -315,6 +317,9 @@ pub fn draw(
     egui::ScrollArea::both()
         .id_source(("editor_scroll", tab.id))
         .max_height(editor_height)
+        // Keep the pane at its allotted height even when the SQL is short, so
+        // the splitter below stays put.
+        .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 let gutter_width = if line_numbers {
@@ -325,11 +330,7 @@ pub fn draw(
                 // No-wrap keeps rows 1:1 with source lines (gutter alignment);
                 // long lines scroll horizontally.
                 let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
-                    if highlights.is_empty() {
-                        super::layout_code_no_wrap(ui, text)
-                    } else {
-                        layout_with_matches(ui, text, &highlights, current_match)
-                    }
+                    super::layout_sql(ui, text, &highlights, current_match)
                 };
                 let editor_width =
                     (panel_width - gutter_width - ui.spacing().item_spacing.x * 2.0).max(200.0);
@@ -352,6 +353,43 @@ pub fn draw(
                 editor_output = Some(output);
             });
         });
+
+    // Draggable splitter between the editor and the results area.
+    // Double-click resets to the default split.
+    let (splitter_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 10.0),
+        egui::Sense::hover(),
+    );
+    // The grab surface bleeds 2px past the strip; the cursor zone is wider
+    // still. Both checked after the editor draws, so the resize cursor beats
+    // the TextEdit's I-beam along the boundary.
+    let splitter_resp = ui.interact(
+        splitter_rect.expand2(egui::vec2(0.0, 2.0)),
+        ui.id().with(("editor_splitter", tab.id)),
+        egui::Sense::click_and_drag(),
+    );
+    let splitter_hot = ui.rect_contains_pointer(splitter_rect.expand2(egui::vec2(0.0, 4.0)))
+        || splitter_resp.dragged();
+    if splitter_hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if splitter_resp.dragged() && split_avail > 0.0 {
+        tab.editor_frac = ((editor_height + splitter_resp.drag_delta().y) / split_avail)
+            .clamp(0.05, 0.95);
+    }
+    if splitter_resp.double_clicked() {
+        tab.editor_frac = crate::session::default_editor_frac();
+    }
+    let splitter_stroke = if splitter_hot {
+        egui::Stroke::new(2.0, super::theme::ACCENT)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    ui.painter().hline(
+        splitter_rect.x_range(),
+        splitter_rect.center().y,
+        splitter_stroke,
+    );
 
     // Ctrl+Enter runs the query; Ctrl+S saves the file.
     if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) && !running {
@@ -779,52 +817,6 @@ fn replace_chars(s: &str, start: usize, len: usize, rep: &str) -> String {
 }
 
 /// Monospace layout with find-match backgrounds; the current match is louder.
-fn layout_with_matches(
-    ui: &egui::Ui,
-    text: &str,
-    matches: &[(usize, usize)],
-    current: usize,
-) -> Arc<egui::Galley> {
-    use egui::text::{LayoutJob, LayoutSection, TextFormat};
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let color = ui.visuals().widgets.inactive.text_color();
-    let normal = TextFormat { font_id: font.clone(), color, ..Default::default() };
-    let hl_bg = egui::Color32::from_rgba_unmultiplied(235, 203, 80, 70);
-    let cur_bg = egui::Color32::from_rgba_unmultiplied(235, 160, 60, 140);
-
-    // Char offsets → byte offsets in one pass.
-    let mut byte_at: Vec<usize> = Vec::with_capacity(text.chars().count() + 1);
-    for (b, _) in text.char_indices() {
-        byte_at.push(b);
-    }
-    byte_at.push(text.len());
-
-    let mut job = LayoutJob {
-        text: text.to_owned(),
-        ..Default::default()
-    };
-    job.wrap.max_width = f32::INFINITY;
-    let mut push = |range: std::ops::Range<usize>, format: TextFormat| {
-        if !range.is_empty() {
-            job.sections.push(LayoutSection { leading_space: 0.0, byte_range: range, format });
-        }
-    };
-    let mut pos = 0usize; // bytes
-    for (mi, &(cs, cl)) in matches.iter().enumerate() {
-        let (Some(&bs), Some(&be)) = (byte_at.get(cs), byte_at.get(cs + cl)) else { continue };
-        if bs < pos {
-            continue;
-        }
-        push(pos..bs, normal.clone());
-        let mut fmt = normal.clone();
-        fmt.background = if mi == current { cur_bg } else { hl_bg };
-        push(bs..be, fmt);
-        pos = be;
-    }
-    push(pos..text.len(), normal);
-    ui.fonts(|f| f.layout_job(job))
-}
-
 /// Reformat the whole buffer with sqlformat.
 fn format_sql(tab: &mut QueryTab) {
     let formatted = sqlformat::format(

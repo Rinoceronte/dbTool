@@ -44,6 +44,97 @@ pub fn layout_code_no_wrap(ui: &egui::Ui, text: &str) -> Arc<egui::Galley> {
     })
 }
 
+/// Keywords worth coloring that the completion list doesn't carry (statement
+/// verbs the completer never suggests mid-query).
+const HIGHLIGHT_EXTRA_KEYWORDS: &[&str] = &[
+    "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "START", "CAST", "ASC", "DESC", "NULLS",
+    "FIRST", "LAST", "COLUMN", "ADD", "CONSTRAINT", "UNIQUE", "CHECK", "IF", "REPLACE",
+    "TEMPORARY", "TEMP", "FUNCTION", "PROCEDURE", "TRIGGER", "SEQUENCE", "RETURNS", "LANGUAGE",
+    "GRANT", "REVOKE", "ANALYZE", "VACUUM", "CONFLICT", "DO", "NOTHING",
+];
+
+/// Layout SQL with syntax highlighting and optional find-match backgrounds.
+/// No wrapping — pair with a horizontal ScrollArea (gutter alignment).
+pub fn layout_sql(
+    ui: &egui::Ui,
+    text: &str,
+    matches: &[(usize, usize)],
+    current_match: usize,
+) -> Arc<egui::Galley> {
+    use crate::sql_complete::{keywords, lexer};
+    use egui::text::{LayoutJob, LayoutSection, TextFormat};
+    use egui::Color32;
+
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let default_color = ui.visuals().widgets.inactive.text_color();
+    if text.is_empty() {
+        return layout_code_no_wrap(ui, text);
+    }
+    let dark = ui.visuals().dark_mode;
+    let kw_color = if dark { Color32::from_rgb(97, 158, 232) } else { Color32::from_rgb(20, 80, 170) };
+    let str_color = if dark { Color32::from_rgb(152, 195, 121) } else { Color32::from_rgb(80, 140, 60) };
+    let num_color = if dark { Color32::from_rgb(209, 154, 102) } else { Color32::from_rgb(170, 90, 0) };
+    let cmt_color = if dark { Color32::from_rgb(106, 120, 132) } else { Color32::from_rgb(140, 148, 158) };
+    let qid_color = if dark { Color32::from_rgb(86, 182, 194) } else { Color32::from_rgb(0, 120, 135) };
+
+    let n = text.chars().count();
+    let mut colors = vec![default_color; n];
+    for tok in lexer::tokenize(text) {
+        let c = match tok.kind {
+            lexer::TokKind::Comment => cmt_color,
+            lexer::TokKind::String => str_color,
+            lexer::TokKind::Number => num_color,
+            lexer::TokKind::QuotedIdent => qid_color,
+            lexer::TokKind::Word
+                if keywords::is_keyword(&tok.raw)
+                    || HIGHLIGHT_EXTRA_KEYWORDS
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(&tok.raw)) =>
+            {
+                kw_color
+            }
+            _ => continue,
+        };
+        colors[tok.start..tok.end.min(n)].fill(c);
+    }
+
+    let hl_bg = Color32::from_rgba_unmultiplied(235, 203, 80, 70);
+    let cur_bg = Color32::from_rgba_unmultiplied(235, 160, 60, 140);
+    let mut bgs = vec![Color32::TRANSPARENT; n];
+    for (mi, &(cs, cl)) in matches.iter().enumerate() {
+        let bg = if mi == current_match { cur_bg } else { hl_bg };
+        bgs[cs.min(n)..(cs + cl).min(n)].fill(bg);
+    }
+
+    let mut job = LayoutJob { text: text.to_owned(), ..Default::default() };
+    job.wrap.max_width = f32::INFINITY;
+    let mut push = |byte_range: std::ops::Range<usize>, attr: (Color32, Color32)| {
+        job.sections.push(LayoutSection {
+            leading_space: 0.0,
+            byte_range,
+            format: TextFormat {
+                font_id: font.clone(),
+                color: attr.0,
+                background: attr.1,
+                ..Default::default()
+            },
+        });
+    };
+    // Coalesce per-char (color, background) runs into byte-ranged sections.
+    let mut run_start = 0usize;
+    let mut run_attr = (colors[0], bgs[0]);
+    for (ci, (b, _)) in text.char_indices().enumerate() {
+        let attr = (colors[ci], bgs[ci]);
+        if attr != run_attr {
+            push(run_start..b, run_attr);
+            run_start = b;
+            run_attr = attr;
+        }
+    }
+    push(run_start..text.len(), run_attr);
+    ui.fonts(|f| f.layout_job(job))
+}
+
 /// Right-aligned line-number gutter matching a monospace TextEdit's rows;
 /// returns its width so callers can budget the editor's desired width.
 pub fn line_number_gutter(ui: &mut egui::Ui, text: &str) -> f32 {
@@ -239,6 +330,8 @@ pub struct QueryTab {
     pub run_started: Option<std::time::Instant>,
     /// When the last run finished (auto-refresh pacing).
     pub last_finish: Option<std::time::Instant>,
+    /// Fraction of the tab's height the editor occupies (draggable splitter).
+    pub editor_frac: f32,
 }
 
 /// Where an editable query result's rows live, and how to address them.
@@ -303,6 +396,7 @@ impl QueryTab {
             auto_refresh_secs: None,
             run_started: None,
             last_finish: None,
+            editor_frac: crate::session::default_editor_frac(),
         }
     }
 

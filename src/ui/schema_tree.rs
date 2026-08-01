@@ -219,6 +219,9 @@ pub fn draw_tree(ui: &mut egui::Ui, conn: &mut ActiveConnection, filter: &str) -
                     );
                 }
             });
+            if ui.rect_contains_pointer(resp.header_response.rect) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
             resp.header_response.context_menu(|ui| {
                 if ui.button("New table…").clicked() {
                     action = TreeAction::NewTable(conn.conn_id, schema.name.clone());
