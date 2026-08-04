@@ -6061,15 +6061,19 @@ impl App {
                             delim
                         }
                     };
-                    (
-                        d.format,
-                        delimiter,
-                        d.path.trim().to_string(),
-                        d.include_header,
-                        d.conn,
-                        d.source.clone(),
-                    )
+                    let mut path = d.path.trim().to_string();
+                    let ext = match d.format {
+                        crate::csv_export::ExportFormat::Csv => ".csv",
+                        crate::csv_export::ExportFormat::Json => ".json",
+                    };
+                    if !path.to_ascii_lowercase().ends_with(ext) {
+                        path.push_str(ext);
+                    }
+                    (d.format, delimiter, path, d.include_header, d.conn, d.source.clone())
                 };
+                if let Some(d) = self.export_dialog.as_mut() {
+                    d.path = path.clone();
+                }
                 let options = crate::csv_export::ExportOptions { format, delimiter, include_header };
                 match source {
                     ExportSource::Table { schema, table } => {
